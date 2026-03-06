@@ -18,6 +18,7 @@ package io.aeron.samples;
 
 import io.aeron.Aeron;
 import io.aeron.Publication;
+import io.aeron.driver.MediaDriver;
 import org.agrona.BitUtil;
 import org.agrona.BufferUtil;
 import org.agrona.concurrent.UnsafeBuffer;
@@ -50,15 +51,21 @@ public class SimplePublisher
 
         System.out.println("Publishing to " + channel + " on stream id " + streamId);
 
-        // Create a context, needed for client connection to media driver
-        // A separate media driver process needs to be running prior to starting this application
+        // If -Daeron.sample.embeddedMediaDriver=true, use an embedded driver; otherwise a separate
+        // media driver process must be running (e.g. aeron-samples/scripts/media-driver).
+        final boolean embedded = SampleConfiguration.EMBEDDED_MEDIA_DRIVER;
         final Aeron.Context ctx = new Aeron.Context();
 
-        // Create an Aeron instance with client-provided context configuration and connect to the
-        // media driver, and create a Publication. The Aeron and Publication classes implement
-        // AutoCloseable, and will automatically clean up resources when this try block is finished.
-        try (Aeron aeron = Aeron.connect(ctx);
-            Publication publication = aeron.addPublication(channel, streamId))
+        try (MediaDriver driver = embedded ? MediaDriver.launchEmbedded() : null)
+        {
+            if (embedded)
+            {
+                ctx.aeronDirectoryName(driver.aeronDirectoryName());
+            }
+
+            // Create an Aeron instance and connect to the media driver, then create a Publication.
+            try (Aeron aeron = Aeron.connect(ctx);
+                Publication publication = aeron.addPublication(channel, streamId))
         {
             final String message = "Hello World! ";
             final byte[] messageBytes = message.getBytes();
@@ -114,6 +121,7 @@ public class SimplePublisher
             }
 
             System.out.println("Done sending.");
+        }
         }
     }
 }

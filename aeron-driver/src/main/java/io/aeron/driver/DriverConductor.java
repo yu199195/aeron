@@ -167,9 +167,22 @@ import static org.agrona.collections.ArrayListUtil.fastUnorderedRemove;
 
 /**
  * Driver Conductor that takes commands from publishers and subscribers, and orchestrates the media driver.
+ *
+ * 【源码解析】DriverConductor —— Media Driver 的"大脑"，三大核心 Agent 之一。
+ *
+ * 职责：
+ * 1. 消费 Client 通过 CnC to-driver RingBuffer 发来的命令（ADD_PUBLICATION / ADD_SUBSCRIPTION / REMOVE 等）
+ * 2. 创建和管理所有 Publication、Subscription、Image、ChannelEndpoint 等资源的生命周期
+ * 3. 通过 ReceiverProxy / SenderProxy 将操作委派给 Receiver 和 Sender Agent（线程安全的命令队列）
+ * 4. 通过 ClientProxy 将响应和事件写入 CnC to-clients BroadcastBuffer 回传给 Client
+ * 5. 定期执行定时器任务：心跳检查、客户端活性检测、资源清理、流位置追踪等
+ *
+ * 线程模型：在 DEDICATED 模式下独占一个线程；在 SHARED 模式下与 Sender/Receiver 共享线程。
+ * 实现 Agent 接口，核心驱动方法是 doWork()，由 AgentRunner 循环调用。
  */
 public final class DriverConductor implements Agent
 {
+    // 时钟更新最小间隔 1ms，减少 nanoClock 系统调用频率
     private static final long CLOCK_UPDATE_INTERNAL_NS = TimeUnit.MILLISECONDS.toNanos(1);
     private static final String[] INVALID_DESTINATION_KEYS = {
         MTU_LENGTH_PARAM_NAME,
@@ -181,66 +194,74 @@ public final class DriverConductor implements Agent
 
     static final long EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS = 1;
 
+    // 随机 sessionId 起点，每次创建 Publication 递增，避免与其他 Driver 实例冲突
     private int nextSessionId = BitUtil.generateRandomisedId();
-    private final long timerIntervalNs;
-    private final long clientLivenessTimeoutNs;
-    private long timeOfLastToDriverPositionChangeNs;
-    private long lastCommandConsumerPosition;
-    private long timerCheckDeadlineNs;
-    private long clockUpdateDeadlineNs;
+    private final long timerIntervalNs;          // 定时器检查间隔（心跳、客户端活性、资源清理）
+    private final long clientLivenessTimeoutNs;  // 客户端存活超时，超过此时间未心跳则视为断连
+    private long timeOfLastToDriverPositionChangeNs; // 上次 to-driver 命令位置变化的纳秒时间戳
+    private long lastCommandConsumerPosition;    // to-driver RingBuffer 的消费位置，用于检测命令卡住
+    private long timerCheckDeadlineNs;           // 下一次定时器检查的截止时间
+    private long clockUpdateDeadlineNs;          // 下一次缓存时钟更新的截止时间
 
-    private final Context ctx;
-    private final LogFactory logFactory;
-    private final ReceiverProxy receiverProxy;
-    private final SenderProxy senderProxy;
-    private final ClientProxy clientProxy;
-    private final RingBuffer toDriverCommands;
-    private final ClientCommandAdapter clientCommandAdapter;
-    private final ManyToOneConcurrentLinkedQueue<Runnable> driverCmdQueue;
+    private final Context ctx;                   // MediaDriver 上下文，包含所有配置和共享对象
+    private final LogFactory logFactory;         // 创建 LogBuffer（Term Buffer）的工厂
+    private final ReceiverProxy receiverProxy;   // 向 Receiver Agent 发送命令的代理（线程安全队列）
+    private final SenderProxy senderProxy;       // 向 Sender Agent 发送命令的代理（线程安全队列）
+    private final ClientProxy clientProxy;       // 向 Client 回写响应/事件的代理（写入 CnC to-clients BroadcastBuffer）
+    private final RingBuffer toDriverCommands;   // CnC to-driver 环形缓冲区，Client → Driver 的命令通道
+    private final ClientCommandAdapter clientCommandAdapter; // 命令适配器：从 RingBuffer 读命令并分发到对应处理方法
+    private final ManyToOneConcurrentLinkedQueue<Runnable> driverCmdQueue; // Receiver/Sender → Conductor 的内部命令队列
+
+    // === 资源注册表 ===
     private final Object2ObjectHashMap<String, SendChannelEndpoint> sendChannelEndpointByChannelMap =
-        new Object2ObjectHashMap<>();
+        new Object2ObjectHashMap<>();             // 发送端 channel → endpoint 映射（按 canonical 地址去重）
     private final Object2ObjectHashMap<String, ReceiveChannelEndpoint> receiveChannelEndpointByChannelMap =
-        new Object2ObjectHashMap<>();
-    private final ArrayList<NetworkPublication> networkPublications = new ArrayList<>();
-    private final ArrayList<IpcPublication> ipcPublications = new ArrayList<>();
-    private final ArrayList<PublicationImage> publicationImages = new ArrayList<>();
-    private final ArrayList<PublicationLink> publicationLinks = new ArrayList<>();
-    private final ArrayList<SubscriptionLink> subscriptionLinks = new ArrayList<>();
-    private final ArrayList<CounterLink> counterLinks = new ArrayList<>();
-    private final ArrayList<AeronClient> clients = new ArrayList<>();
-    private final ArrayDeque<DriverManagedResource> endOfLifeResources = new ArrayDeque<>();
-    private final ObjectHashSet<SessionKey> activeSessionSet = new ObjectHashSet<>();
+        new Object2ObjectHashMap<>();             // 接收端 channel → endpoint 映射
+    private final ArrayList<NetworkPublication> networkPublications = new ArrayList<>();   // 所有网络 Publication
+    private final ArrayList<IpcPublication> ipcPublications = new ArrayList<>();           // 所有 IPC Publication
+    private final ArrayList<PublicationImage> publicationImages = new ArrayList<>();       // 所有接收到的 PublicationImage
+    private final ArrayList<PublicationLink> publicationLinks = new ArrayList<>();         // Client ↔ Publication 的关联
+    private final ArrayList<SubscriptionLink> subscriptionLinks = new ArrayList<>();       // Client ↔ Subscription 的关联
+    private final ArrayList<CounterLink> counterLinks = new ArrayList<>();                 // Client ↔ Counter 的关联
+    private final ArrayList<AeronClient> clients = new ArrayList<>();                      // 已注册的 Aeron Client 列表
+    private final ArrayDeque<DriverManagedResource> endOfLifeResources = new ArrayDeque<>(); // 待释放的生命周期结束资源
+    private final ObjectHashSet<SessionKey> activeSessionSet = new ObjectHashSet<>();      // 活跃 sessionId 集合（防冲突）
+
     private final EpochClock epochClock;
     private final NanoClock nanoClock;
-    private final CachedEpochClock cachedEpochClock;
-    private final CachedNanoClock cachedNanoClock;
-    private final CountersManager countersManager;
+    private final CachedEpochClock cachedEpochClock;   // 缓存的毫秒级时钟，减少系统调用
+    private final CachedNanoClock cachedNanoClock;     // 缓存的纳秒级时钟
+    private final CountersManager countersManager;     // CnC Counters 管理器，分配/释放计数器
     private final NetworkPublicationThreadLocals networkPublicationThreadLocals = new NetworkPublicationThreadLocals();
     private final MutableDirectBuffer tempBuffer;
     private final DataHeaderFlyweight defaultDataHeader = new DataHeaderFlyweight(createDefaultHeader(0, 0, 0));
-    private final AtomicCounter errorCounter;
-    private final AtomicCounter imagesRejected;
-    private final DutyCycleTracker dutyCycleTracker;
-    private final Executor asyncTaskExecutor;
-    private final boolean asyncExecutionDisabled;
-    private boolean asyncClientCommandInFlight;
-    private TimeTrackingNameResolver nameResolver;
+    private final AtomicCounter errorCounter;          // 全局错误计数
+    private final AtomicCounter imagesRejected;        // 被拒绝的 Image 计数
+    private final DutyCycleTracker dutyCycleTracker;   // 工作周期耗时追踪器
+    private final Executor asyncTaskExecutor;          // 异步任务执行器（DNS 解析等）
+    private final boolean asyncExecutionDisabled;      // 是否禁用异步执行
+    private boolean asyncClientCommandInFlight;        // 是否有异步客户端命令正在执行中
+    private TimeTrackingNameResolver nameResolver;     // 名称解析器（支持 DNS 动态解析）
 
+    /**
+     * 【构造函数】从 MediaDriver.Context 中提取所有必要的依赖注入到 Conductor 中。
+     * 注意：此时三大 Agent 尚未启动，这里只做字段初始化。
+     */
     DriverConductor(final MediaDriver.Context ctx)
     {
         this.ctx = ctx;
-        timerIntervalNs = ctx.timerIntervalNs();
-        clientLivenessTimeoutNs = ctx.clientLivenessTimeoutNs();
-        driverCmdQueue = ctx.driverCommandQueue();
-        receiverProxy = ctx.receiverProxy();
-        senderProxy = ctx.senderProxy();
-        logFactory = ctx.logFactory();
+        timerIntervalNs = ctx.timerIntervalNs();           // 定时器间隔，默认 1 秒
+        clientLivenessTimeoutNs = ctx.clientLivenessTimeoutNs(); // 客户端存活超时，默认 10 秒
+        driverCmdQueue = ctx.driverCommandQueue();         // Receiver/Sender → Conductor 的内部命令队列
+        receiverProxy = ctx.receiverProxy();               // 向 Receiver 下发命令的代理
+        senderProxy = ctx.senderProxy();                   // 向 Sender 下发命令的代理
+        logFactory = ctx.logFactory();                     // LogBuffer 工厂
         epochClock = ctx.epochClock();
         nanoClock = ctx.nanoClock();
         cachedEpochClock = ctx.cachedEpochClock();
         cachedNanoClock = ctx.cachedNanoClock();
-        toDriverCommands = ctx.toDriverCommands();
-        clientProxy = ctx.clientProxy();
+        toDriverCommands = ctx.toDriverCommands();         // CnC to-driver RingBuffer
+        clientProxy = ctx.clientProxy();                   // 向 Client 写事件的代理
         tempBuffer = ctx.tempBuffer();
         errorCounter = ctx.systemCounters().get(ERRORS);
         imagesRejected = ctx.systemCounters().get(IMAGES_REJECTED);
@@ -251,6 +272,7 @@ public final class DriverConductor implements Agent
 
         countersManager = ctx.countersManager();
 
+        // ClientCommandAdapter 负责从 toDriverCommands 中读取命令并路由到对应的 onXxx 处理方法
         clientCommandAdapter = new ClientCommandAdapter(
             errorCounter,
             ctx.errorHandler(),
@@ -258,22 +280,28 @@ public final class DriverConductor implements Agent
             clientProxy,
             this);
 
+        // 记录初始消费位置，用于后续检测命令通道是否卡住
         lastCommandConsumerPosition = toDriverCommands.consumerPosition();
     }
 
     /**
      * {@inheritDoc}
      */
+    /**
+     * 【Agent 启动回调】在 AgentRunner 的线程中，第一次调用 doWork() 之前被调用。
+     * 初始化缓存时钟、各种截止时间、名称解析器。
+     */
     public void onStart()
     {
         final long nowNs = nanoClock.nanoTime();
-        cachedNanoClock.update(nowNs);
-        cachedEpochClock.update(epochClock.time());
-        dutyCycleTracker.update(nowNs);
-        timerCheckDeadlineNs = nowNs + timerIntervalNs;
-        clockUpdateDeadlineNs = nowNs + CLOCK_UPDATE_INTERNAL_NS;
+        cachedNanoClock.update(nowNs);               // 初始化缓存的纳秒时钟
+        cachedEpochClock.update(epochClock.time());   // 初始化缓存的毫秒时钟
+        dutyCycleTracker.update(nowNs);               // 初始化工作周期追踪
+        timerCheckDeadlineNs = nowNs + timerIntervalNs;           // 设置第一次定时器检查的时间
+        clockUpdateDeadlineNs = nowNs + CLOCK_UPDATE_INTERNAL_NS; // 设置第一次时钟更新的时间
         timeOfLastToDriverPositionChangeNs = nowNs;
 
+        // 初始化名称解析器：如果配置了 resolverInterface 则使用 DriverNameResolver（支持集群名称解析），否则用简单的 nameResolver
         nameResolver = new TimeTrackingNameResolver(
             null == ctx.resolverInterface() ? ctx.nameResolver() : new DriverNameResolver(ctx),
             nanoClock,
@@ -285,6 +313,15 @@ public final class DriverConductor implements Agent
 
     /**
      * {@inheritDoc}
+     */
+    /**
+     * 【Agent 关闭回调】Driver 关闭时的资源清理：
+     * 1. 停止异步任务执行器
+     * 2. 关闭名称解析器
+     * 3. 关闭所有 ChannelEndpoint（释放 UDP Socket）
+     * 4. 释放所有 Publication/Image 的 LogBuffer（mmap 内存）
+     * 5. 清除心跳并刷盘 CnC 文件
+     * 6. 关闭 Context（释放 CnC mmap 等）
      */
     public void onClose()
     {
@@ -305,15 +342,15 @@ public final class DriverConductor implements Agent
             }
         }
         CloseHelper.close(ctx.errorHandler(), nameResolver);
-        CloseHelper.closeAll(receiveChannelEndpointByChannelMap.values());
-        CloseHelper.closeAll(sendChannelEndpointByChannelMap.values());
-        publicationImages.forEach(PublicationImage::free);
-        networkPublications.forEach(NetworkPublication::free);
-        ipcPublications.forEach(IpcPublication::free);
-        freeEndOfLifeResources(Integer.MAX_VALUE);
-        toDriverCommands.consumerHeartbeatTime(NULL_VALUE);
-        ctx.cncByteBuffer().force();
-        ctx.close();
+        CloseHelper.closeAll(receiveChannelEndpointByChannelMap.values());  // 关闭所有接收端 endpoint
+        CloseHelper.closeAll(sendChannelEndpointByChannelMap.values());    // 关闭所有发送端 endpoint
+        publicationImages.forEach(PublicationImage::free);                 // 释放所有 Image 的 LogBuffer
+        networkPublications.forEach(NetworkPublication::free);             // 释放所有网络 Publication 的 LogBuffer
+        ipcPublications.forEach(IpcPublication::free);                     // 释放所有 IPC Publication 的 LogBuffer
+        freeEndOfLifeResources(Integer.MAX_VALUE);                         // 释放所有排队中的待清理资源
+        toDriverCommands.consumerHeartbeatTime(NULL_VALUE);                // 清除心跳，通知 Client: Driver 已关闭
+        ctx.cncByteBuffer().force();                                       // 刷盘 CnC 文件
+        ctx.close();                                                       // 释放 Context 持有的所有 mmap / fd
     }
 
     /**
@@ -327,21 +364,34 @@ public final class DriverConductor implements Agent
     /**
      * {@inheritDoc}
      */
+    /**
+     * 【核心工作循环】由 AgentRunner 反复调用，每次执行以下 6 步：
+     *
+     * 1. processTimers —— 定时任务：客户端心跳检查、Publication/Image 清理、position 追踪
+     * 2. clientCommandAdapter.receive —— 从 CnC to-driver RingBuffer 读取并处理 Client 命令
+     *    （若有异步命令正在飞行中则跳过，防止乱序）
+     * 3. drainCommandQueue —— 处理来自 Receiver/Sender 通过 driverCmdQueue 发来的内部命令
+     * 4. trackStreamPositions —— 追踪所有 Publication/Image 的 position，更新流控相关计数器
+     * 5. nameResolver.doWork —— 驱动名称解析器（DNS 刷新等）
+     * 6. freeEndOfLifeResources —— 释放达到 linger 超时的已关闭资源
+     *
+     * @return workCount > 0 表示做了有意义的工作，IdleStrategy 据此决定是否空闲等待
+     */
     public int doWork()
     {
         final long nowNs = nanoClock.nanoTime();
-        trackTime(nowNs);
+        trackTime(nowNs);   // 更新缓存时钟（cachedEpochClock / cachedNanoClock）
 
         int workCount = 0;
-        workCount += processTimers(nowNs);
+        workCount += processTimers(nowNs);                              // 步骤 1：定时器
         if (!asyncClientCommandInFlight)
         {
-            workCount += clientCommandAdapter.receive();
+            workCount += clientCommandAdapter.receive();                // 步骤 2：消费 Client 命令
         }
-        workCount += drainCommandQueue();
-        workCount += trackStreamPositions(workCount, nowNs);
-        workCount += nameResolver.doWork(cachedEpochClock.time());
-        workCount += freeEndOfLifeResources(ctx.resourceFreeLimit());
+        workCount += drainCommandQueue();                               // 步骤 3：内部命令队列
+        workCount += trackStreamPositions(workCount, nowNs);            // 步骤 4：流位置追踪
+        workCount += nameResolver.doWork(cachedEpochClock.time());      // 步骤 5：名称解析
+        workCount += freeEndOfLifeResources(ctx.resourceFreeLimit());   // 步骤 6：资源回收
 
         return workCount;
     }
@@ -630,6 +680,18 @@ public final class DriverConductor implements Agent
         return null;
     }
 
+    /**
+     * 【处理 ADD_PUBLICATION 命令（网络类型）】
+     * 当 Client 调用 aeron.addPublication("aeron:udp?endpoint=...", streamId) 时触发。
+     *
+     * 核心流程：
+     * 1. 异步解析 channel URI（可能涉及 DNS），得到 UdpChannel
+     * 2. 获取或创建 SendChannelEndpoint（复用同一 UDP Socket 发送多个 stream）
+     * 3. 非 exclusive 模式下尝试复用已有 Publication（相同 streamId + endpoint）
+     * 4. 若无可复用的，创建新 NetworkPublication（分配 LogBuffer、sessionId、Counters）
+     * 5. 通过 clientProxy 向 Client 回写 PUBLICATION_READY 事件
+     * 6. 新 Publication 创建后，自动 link 已有的 Spy Subscription
+     */
     void onAddNetworkPublication(
         final String channel,
         final int streamId,
@@ -639,11 +701,12 @@ public final class DriverConductor implements Agent
     {
         executeAsyncClientTask(
             correlationId,
-            () -> UdpChannel.parse(channel, nameResolver, false),
+            () -> UdpChannel.parse(channel, nameResolver, false),  // 异步: 解析 URI，可能触发 DNS
             (asyncResult) ->
             {
                 final UdpChannel udpChannel = asyncResult.get();
                 final ChannelUri channelUri = udpChannel.channelUri();
+                // 从 URI 中提取 Publication 参数（termLength, mtu, initialTermId 等）
                 final PublicationParams params =
                     getPublicationParams(channelUri, ctx, this, streamId, udpChannel.canonicalForm());
                 validateExperimentalFeatures(ctx.enableExperimentalFeatures(), udpChannel);
@@ -651,9 +714,11 @@ public final class DriverConductor implements Agent
                 validateControlForPublication(udpChannel);
                 validateResponseSubscription(params);
 
+                // 获取或创建 SendChannelEndpoint：同一 UDP 地址复用同一个 endpoint（底层同一个 DatagramChannel）
                 final SendChannelEndpoint channelEndpoint =
                     getOrCreateSendChannelEndpoint(params, udpChannel, correlationId);
 
+                // 非 exclusive 模式：尝试找到相同 streamId + endpoint 的已有 Publication 进行复用
                 NetworkPublication publication = null;
                 if (!isExclusive)
                 {
@@ -666,6 +731,7 @@ public final class DriverConductor implements Agent
                 boolean isNewPublication = false;
                 if (null == publication)
                 {
+                    // 新建 Publication：检查 session 冲突，分配 LogBuffer 和 Counters
                     checkForSessionClash(params.sessionId, streamId, udpChannel.canonicalForm(), channel);
                     publication = newNetworkPublication(
                         correlationId, clientId, streamId, channel, udpChannel, channelEndpoint, params, isExclusive);
@@ -673,6 +739,7 @@ public final class DriverConductor implements Agent
                 }
                 else
                 {
+                    // 复用已有 Publication，校验参数一致性
                     confirmMatch(
                         channelUri,
                         params,
@@ -687,18 +754,21 @@ public final class DriverConductor implements Agent
                         params, publication.spiesSimulateConnection(), channel, publication.channel());
                 }
 
+                // 记录 Client ↔ Publication 的关联，用于后续 Client 断连时清理
                 publicationLinks.add(new PublicationLink(correlationId, getOrAddClient(clientId), publication));
 
+                // 通过 CnC to-clients BroadcastBuffer 向 Client 发送 PUBLICATION_READY 事件
                 clientProxy.onPublicationReady(
                     correlationId,
                     publication.registrationId(),
                     streamId,
                     publication.sessionId(),
-                    publication.rawLog().fileName(),
-                    publication.publisherLimitId(),
+                    publication.rawLog().fileName(),    // LogBuffer 文件路径，Client 会 mmap 这个文件来写数据
+                    publication.publisherLimitId(),     // publisherLimit 计数器 ID，用于流控
                     channelEndpoint.statusIndicatorCounterId(),
                     isExclusive);
 
+                // 新 Publication 创建后，自动 link 匹配的 Spy Subscription（spy: 订阅发送端的数据副本）
                 if (isNewPublication)
                 {
                     linkSpies(subscriptionLinks, publication);
@@ -989,6 +1059,13 @@ public final class DriverConductor implements Agent
         clientProxy.onUnavailableCounter(registrationId, counterId);
     }
 
+    /**
+     * 【处理 ADD_PUBLICATION 命令（IPC 类型）】
+     * 当 Client 调用 aeron.addPublication("aeron:ipc", streamId) 时触发。
+     *
+     * IPC Publication 不走网络，发送端和接收端通过共享同一个 LogBuffer 文件实现零拷贝通信。
+     * 流程与网络 Publication 类似，但不需要 ChannelEndpoint 和 UDP Socket。
+     */
     void onAddIpcPublication(
         final String channel,
         final int streamId,
@@ -1000,6 +1077,7 @@ public final class DriverConductor implements Agent
         final ChannelUri channelUri = parseUri(channel);
         final PublicationParams params = getPublicationParams(channelUri, ctx, this, streamId, IPC_MEDIA);
 
+        // 非 exclusive 模式：复用相同 streamId 的已有 IPC Publication
         if (!isExclusive)
         {
             publication = findSharedIpcPublication(ipcPublications, streamId, params.responseCorrelationId);
@@ -1027,6 +1105,7 @@ public final class DriverConductor implements Agent
 
         publicationLinks.add(new PublicationLink(correlationId, getOrAddClient(clientId), publication));
 
+        // 回写 PUBLICATION_READY：Client 拿到 logFileName 后 mmap 该文件即可直接写消息
         clientProxy.onPublicationReady(
             correlationId,
             publication.registrationId(),
@@ -1034,9 +1113,10 @@ public final class DriverConductor implements Agent
             publication.sessionId(),
             publication.rawLog().fileName(),
             publication.publisherLimitId(),
-            ChannelEndpointStatus.NO_ID_ALLOCATED,
+            ChannelEndpointStatus.NO_ID_ALLOCATED,  // IPC 无网络 endpoint
             isExclusive);
 
+        // 新 IPC Publication 创建后，自动 link 所有匹配的 IPC Subscription
         if (isNewPublication)
         {
             linkIpcSubscriptions(publication);
@@ -1158,6 +1238,17 @@ public final class DriverConductor implements Agent
         clientProxy.operationSucceeded(correlationId);
     }
 
+    /**
+     * 【处理 ADD_SUBSCRIPTION 命令（网络类型）】
+     * 当 Client 调用 aeron.addSubscription("aeron:udp?endpoint=...", streamId) 时触发。
+     *
+     * 核心流程：
+     * 1. 异步解析 channel URI，得到 UdpChannel
+     * 2. 获取或创建 ReceiveChannelEndpoint（复用同一 UDP Socket 接收多个 stream）
+     * 3. 通过 ReceiverProxy 通知 Receiver Agent 注册 subscription（在 Receiver 线程中添加到 dispatcher）
+     * 4. 通过 clientProxy 向 Client 回写 SUBSCRIPTION_READY 事件
+     * 5. 关联已有匹配的 Image（如果 Publication 端已在发送）
+     */
     void onAddNetworkSubscription(
         final String channel, final int streamId, final long registrationId, final long clientId)
     {
@@ -1177,6 +1268,7 @@ public final class DriverConductor implements Agent
                     SubscriptionParams.getSubscriptionParams(udpChannel.channelUri(), ctx, 0);
                 checkForClashingSubscription(params, udpChannel, streamId);
 
+                // 获取或创建 ReceiveChannelEndpoint：同一 UDP 地址复用同一个 endpoint
                 final ReceiveChannelEndpoint channelEndpoint = getOrCreateReceiveChannelEndpoint(
                     params, udpChannel, registrationId);
 
@@ -1191,11 +1283,12 @@ public final class DriverConductor implements Agent
                 }
                 else
                 {
+                    // 通过 ReceiverProxy 将 subscription 注册到 Receiver Agent
                     addNetworkSubscriptionToReceiver(subscription);
                 }
 
                 clientProxy.onSubscriptionReady(registrationId, channelEndpoint.statusIndicatorCounter().id());
-                linkMatchingImages(subscription);
+                linkMatchingImages(subscription);  // 关联已有的匹配 Image
             });
     }
 
@@ -1219,6 +1312,13 @@ public final class DriverConductor implements Agent
         }
     }
 
+    /**
+     * 【处理 ADD_SUBSCRIPTION 命令（IPC 类型）】
+     * 当 Client 调用 aeron.addSubscription("aeron:ipc", streamId) 时触发。
+     *
+     * IPC Subscription 直接关联同一 Driver 内的 IPC Publication，
+     * 读写双方通过 mmap 同一个 LogBuffer 文件实现零拷贝。
+     */
     void onAddIpcSubscription(final String channel, final int streamId, final long registrationId, final long clientId)
     {
         final SubscriptionParams params = SubscriptionParams.getSubscriptionParams(parseUri(channel), ctx, 0);
@@ -1228,11 +1328,13 @@ public final class DriverConductor implements Agent
         subscriptionLinks.add(subscriptionLink);
         clientProxy.onSubscriptionReady(registrationId, ChannelEndpointStatus.NO_ID_ALLOCATED);
 
+        // 遍历所有 IPC Publication，找到匹配的并立即通知 Client "Image 可用"
         for (int i = 0, size = ipcPublications.size(); i < size; i++)
         {
             final IpcPublication publication = ipcPublications.get(i);
             if (subscriptionLink.matches(publication) && publication.isAcceptingSubscriptions())
             {
+                // 通知 Client: 一个 Image 已可用，附带 LogBuffer 文件路径供 Client mmap
                 clientProxy.onAvailableImage(
                     publication.registrationId(),
                     streamId,
@@ -1303,6 +1405,11 @@ public final class DriverConductor implements Agent
         clientProxy.operationSucceeded(correlationId);
     }
 
+    /**
+     * 【心跳处理】Client 定期通过 CnC to-driver RingBuffer 发送 KEEPALIVE 命令。
+     * Conductor 收到后更新该 Client 的最后心跳时间。
+     * 若超过 clientLivenessTimeoutNs 未收到心跳，processTimers 中会触发 Client 超时清理。
+     */
     void onClientKeepalive(final long clientId)
     {
         final AeronClient client = findClient(clients, clientId);

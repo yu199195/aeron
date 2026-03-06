@@ -326,16 +326,13 @@ public final class Image
     }
 
     /**
-     * Poll for new messages in a stream. If new messages are found beyond the last consumed position then they
-     * will be delivered to the {@link FragmentHandler} up to a limited number of fragments as specified.
-     * <p>
-     * Use a {@link FragmentAssembler} to assemble messages which span multiple fragments.
+     * 从本 Image 的 term buffer 中从 subscriberPosition 起顺序读取帧，交付给 fragmentHandler，
+     * 最多读取 fragmentLimit 个非 padding 帧；读完后更新 subscriberPosition，供 Driver 流控。
+     * 大消息会跨多帧，可用 {@link FragmentAssembler} 按 session 重组。
      *
-     * @param fragmentHandler to which message fragments are delivered.
-     * @param fragmentLimit   for the number of fragments to be consumed during one polling operation.
-     * @return the number of fragments that have been consumed.
-     * @see FragmentAssembler
-     * @see ImageFragmentAssembler
+     * @param fragmentHandler 每个 data 帧的 payload 会回调此 handler。
+     * @param fragmentLimit   本次最多消费的 fragment 数。
+     * @return 本次消费的 fragment 数量。
      */
     public int poll(final FragmentHandler fragmentHandler, final int fragmentLimit)
     {
@@ -345,10 +342,10 @@ public final class Image
         }
 
         int fragmentsRead = 0;
-        final long initialPosition = subscriberPosition.get();
+        final long initialPosition = subscriberPosition.get();   // 当前已消费到的 position
         final int initialOffset = (int)initialPosition & termLengthMask;
         int offset = initialOffset;
-        final UnsafeBuffer termBuffer = activeTermBuffer(initialPosition);
+        final UnsafeBuffer termBuffer = activeTermBuffer(initialPosition);  // 根据 position 选当前 term
         final int capacity = termBuffer.capacity();
         final Header header = this.header;
         header.buffer(termBuffer);
@@ -360,7 +357,7 @@ public final class Image
                 final int frameLength = frameLengthVolatile(termBuffer, offset);
                 if (frameLength <= 0)
                 {
-                    break;
+                    break;  // 尚未写入完成或到 term 末
                 }
 
                 final int frameOffset = offset;
@@ -384,7 +381,7 @@ public final class Image
             final long newPosition = initialPosition + (offset - initialOffset);
             if (newPosition > initialPosition && !isClosed)
             {
-                subscriberPosition.setRelease(newPosition);
+                subscriberPosition.setRelease(newPosition);  // 推进消费位，Driver 据此更新 flow control
             }
         }
 

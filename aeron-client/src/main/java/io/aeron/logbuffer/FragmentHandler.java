@@ -18,22 +18,20 @@ package io.aeron.logbuffer;
 import org.agrona.DirectBuffer;
 
 /**
- * Handler for reading data that is coming from a log buffer. The frame will either contain a whole message
- * or a fragment of a message to be reassembled. Messages are fragmented if greater than the frame for MTU in length.
+ * 从 log buffer 读取数据时的回调：每帧可能是整条消息，或需重组的一条消息的一个 fragment
+ * （当消息长度超过 MTU 时会分片）。DemoReceiver 中传入的 lambda 即实现此接口。
  */
 @FunctionalInterface
 public interface FragmentHandler
 {
     /**
-     * Callback for handling fragments of data being read from a log.
-     * <p>
-     * Within this callback reentrant calls to the {@link io.aeron.Aeron} client are not permitted and
-     * will result in undefined behaviour.
+     * 每从 log 中读到一个 fragment 时调用；payload 在 buffer 的 [offset, offset+length)。
+     * 回调内禁止对 {@link io.aeron.Aeron} 客户端做重入调用（如 addPublication），否则行为未定义。
      *
-     * @param buffer containing the data.
-     * @param offset at which the data begins.
-     * @param length of the data in bytes.
-     * @param header representing the metadata for the data.
+     * @param buffer 包含数据的 buffer（通常为 term buffer 的视图）。
+     * @param offset 数据起始偏移（已跳过 Data 帧头）。
+     * @param length 数据字节长度。
+     * @param header 本帧的元数据（sessionId、termId 等）。
      */
     void onFragment(DirectBuffer buffer, int offset, int length, Header header);
 }

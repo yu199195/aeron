@@ -174,16 +174,13 @@ public final class Subscription extends SubscriptionFields implements AutoClosea
     }
 
     /**
-     * Poll the {@link Image}s under the subscription for available message fragments.
-     * <p>
-     * Each fragment read will be a whole message if it is under MTU length. If larger than MTU then it will come
-     * as a series of fragments ordered within a session.
-     * <p>
-     * To assemble messages that span multiple fragments then use {@link FragmentAssembler}.
+     * 从本订阅下的所有 {@link Image} 中轮询消息 fragment，每次最多处理 fragmentLimit 个，
+     * 用 roundRobin 在多个 Image 之间轮流取（多 Publisher 时公平）。
+     * 每个 fragment 若小于 MTU 即为整条消息，否则为一条消息的一个分片，可用 {@link FragmentAssembler} 重组。
      *
-     * @param fragmentHandler callback for handling each message fragment as it is read.
-     * @param fragmentLimit   number of message fragments to limit when polling across multiple {@link Image}s.
-     * @return the number of fragments received.
+     * @param fragmentHandler 每读到一个 fragment 时的回调（buffer/offset/length/header）。
+     * @param fragmentLimit   本次 poll 最多处理的 fragment 数量。
+     * @return 本次实际处理的 fragment 数量。
      */
     public int poll(final FragmentHandler fragmentHandler, final int fragmentLimit)
     {
@@ -386,9 +383,7 @@ public final class Subscription extends SubscriptionFields implements AutoClosea
     }
 
     /**
-     * Close the Subscription so that associated {@link Image}s can be released.
-     * <p>
-     * This method is idempotent.
+     * 关闭订阅并释放关联的 {@link Image}；向 Driver 发送 REMOVE_SUBSCRIPTION，方法幂等。
      */
     public void close()
     {

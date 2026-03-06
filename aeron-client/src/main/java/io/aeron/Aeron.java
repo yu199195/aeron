@@ -64,10 +64,11 @@ import static org.agrona.SystemUtil.getDurationInNanos;
 import static org.agrona.SystemUtil.getProperty;
 
 /**
- * Aeron entry point for communicating to the Media Driver for creating {@link Publication}s and {@link Subscription}s.
- * Use an {@link Aeron.Context} to configure the Aeron object.
+ * Aeron 客户端入口：与 Media Driver 通信，用于创建 {@link Publication} 和 {@link Subscription}。
+ * 使用 {@link Aeron.Context} 配置客户端；每个 Media Driver 只需一个 Aeron 实例。
  * <p>
- * A client application requires only one Aeron object per Media Driver.
+ * 内部通过 command buffer（toDriverBuffer）向 Driver 发送命令，通过 broadcast buffer（toClientBuffer）
+ * 接收响应与事件；{@link ClientConductor} 在独立线程或 {@link AgentInvoker} 中轮询处理这些响应。
  * <p>
  * <b>Note:</b> If {@link Aeron.Context#errorHandler(ErrorHandler)} is not set and a {@link DriverTimeoutException}
  * occurs then the process will face the wrath of {@link System#exit(int)}.
@@ -137,11 +138,10 @@ public final class Aeron implements AutoCloseable
     }
 
     /**
-     * Create an Aeron instance and connect to the media driver with a default {@link Context}.
-     * <p>
-     * Threads required for interacting with the media driver are created and managed within the Aeron instance.
+     * 使用默认 {@link Context} 创建 Aeron 实例并连接到 Media Driver。
+     * 与 Driver 交互所需的线程（ClientConductor）在 Aeron 内部创建并管理。
      *
-     * @return the new {@link Aeron} instance connected to the Media Driver.
+     * @return 已连接到 Media Driver 的新 {@link Aeron} 实例。
      */
     public static Aeron connect()
     {
@@ -149,15 +149,13 @@ public final class Aeron implements AutoCloseable
     }
 
     /**
-     * Create an Aeron instance and connect to the media driver.
-     * <p>
-     * Threads required for interacting with the media driver are created and managed within the Aeron instance.
-     * <p>
-     * If an exception occurs while trying to establish a connection then the {@link Context#close()} method
-     * will be called on the passed context.
+     * 使用指定 {@link Context} 创建 Aeron 实例并连接到 Media Driver。
+     * 连接过程会：conclude context（含连接 CnC 文件、创建 toDriver/toClient buffer）、
+     * 构造 ClientConductor、启动 Conductor 线程或 AgentInvoker。
+     * 若连接过程中抛异常，会对传入的 ctx 调用 {@link Context#close()}。
      *
-     * @param ctx for configuration of the client.
-     * @return the new {@link Aeron} instance connected to the Media Driver.
+     * @param ctx 客户端配置（如 aeronDirectoryName 必须指向 Driver 的目录）。
+     * @return 已连接到 Media Driver 的新 {@link Aeron} 实例。
      */
     public static Aeron connect(final Context ctx)
     {
@@ -267,11 +265,9 @@ public final class Aeron implements AutoCloseable
     }
 
     /**
-     * Clean up and release all Aeron client resources and shutdown conductor thread if not using
-     * {@link Context#useConductorAgentInvoker(boolean)}.
-     * <p>
-     * This will close all currently open {@link Publication}s, {@link Subscription}s, and {@link Counter}s created
-     * from this client. To check for the command being acknowledged by the driver
+     * 关闭并释放所有 Aeron 客户端资源；若未使用 AgentInvoker，会停止 Conductor 线程。
+     * 会关闭由此 client 创建的所有 {@link Publication}、{@link Subscription}、{@link Counter}，
+     * 并向 Driver 发送 CLIENT_CLOSE 等命令。
      */
     public void close()
     {
@@ -290,11 +286,13 @@ public final class Aeron implements AutoCloseable
     }
 
     /**
-     * Add a {@link Publication} for publishing messages to subscribers. The publication returned is threadsafe.
+     * 添加一个用于向订阅者发送消息的 {@link Publication}，返回的实例线程安全（多线程可同时 offer）。
+     * 内部通过 ClientConductor 向 Driver 发送 ADD_PUBLICATION 命令，并阻塞等待 Driver 返回
+     * Publication 就绪（含 log buffer 路径等），再构造并返回 {@link ConcurrentPublication}。
      *
-     * @param channel  for sending the messages known to the media layer.
-     * @param streamId within the channel scope.
-     * @return a new {@link ConcurrentPublication}.
+     * @param channel  媒体层通道（如 aeron:udp?endpoint=localhost:40123）。
+     * @param streamId 通道内的流 ID。
+     * @return 新的 {@link ConcurrentPublication}，可用于 offer 消息。
      */
     public ConcurrentPublication addPublication(final String channel, final int streamId)
     {
@@ -377,15 +375,14 @@ public final class Aeron implements AutoCloseable
     }
 
     /**
-     * Add a new {@link Subscription} for subscribing to messages from publishers.
-     * <p>
-     * The method will set up the {@link Subscription} to use the
-     * {@link Aeron.Context#availableImageHandler(AvailableImageHandler)} and
-     * {@link Aeron.Context#unavailableImageHandler(UnavailableImageHandler)} from the {@link Aeron.Context}.
+     * 添加一个用于接收发布者消息的 {@link Subscription}。
+     * 会使用 Context 中的 availableImageHandler / unavailableImageHandler 处理 Image 可用/不可用。
+     * 内部向 Driver 发送 ADD_SUBSCRIPTION 命令并等待响应；之后当有 Publisher 连接时，
+     * Driver 会通过 toClientBuffer 下发 AVAILABLE_IMAGE 事件，ClientConductor 会为 Subscription 添加 {@link Image}。
      *
-     * @param channel  for receiving the messages known to the media layer.
-     * @param streamId within the channel scope.
-     * @return the {@link Subscription} for the channel and streamId pair.
+     * @param channel  媒体层通道（需与 Publisher 的 channel 一致才能收到消息）。
+     * @param streamId 通道内的流 ID。
+     * @return 该 channel+streamId 对应的 {@link Subscription}，应用通过 poll 拉取数据。
      */
     public Subscription addSubscription(final String channel, final int streamId)
     {
@@ -1152,11 +1149,11 @@ public final class Aeron implements AutoCloseable
         }
 
         /**
-         * This is called automatically by {@link Aeron#connect(Aeron.Context)} and its overloads.
-         * There is no need to call it from a client application. It is responsible for providing default
-         * values for options that are not individually changed through field setters.
+         * 由 {@link Aeron#connect(Aeron.Context)} 自动调用，应用无需直接调用。
+         * 负责：连接 Driver（映射 CnC 文件、创建 toDriverBuffer/toClientBuffer）、
+         * 分配 clientId、创建 DriverProxy、填充默认 idle/error 等配置。
          *
-         * @return this for a fluent API.
+         * @return this，支持链式调用。
          */
         @SuppressWarnings("checkstyle:methodlength")
         public Context conclude()
@@ -1895,7 +1892,8 @@ public final class Aeron implements AutoCloseable
         }
 
         /**
-         * {@inheritDoc}
+         * 设置 Aeron 目录路径，Client 与 Driver 通过该目录下的 CnC 文件通信；嵌入式 Driver 时
+         * 必须设为 {@link MediaDriver#aeronDirectoryName()} 的返回值。
          */
         public Context aeronDirectoryName(final String dirName)
         {

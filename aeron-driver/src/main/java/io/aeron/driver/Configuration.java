@@ -2357,9 +2357,10 @@ public final class Configuration
     }
 
     /**
-     * Validate that the socket buffer lengths are sufficient for the media driver configuration.
+     * 校验 Socket 缓冲区长度是否满足 Media Driver 配置：SO_SNDBUF/SO_RCVBUF 与 MTU、initialWindowLength 关系，
+     * 不满足则打印 WARNING 或抛 ConfigurationException。
      *
-     * @param ctx to be validated.
+     * @param ctx 待校验的 MediaDriver.Context
      */
     public static void validateSocketBufferLengths(final MediaDriver.Context ctx)
     {

@@ -51,34 +51,19 @@ import static org.agrona.BitUtil.align;
  */
 public abstract class Publication implements AutoCloseable
 {
-    /**
-     * The publication is not connected to a subscriber, this can be an intermittent state as subscribers come and go.
-     */
+    /** offer 失败：当前没有订阅者连接，可能是间歇状态（订阅者尚未启动或已断开）。 */
     public static final long NOT_CONNECTED = -1;
 
-    /**
-     * The offer failed due to back pressure from the subscribers preventing further transmission.
-     */
+    /** offer 失败：背压。订阅者消费慢或流控窗口满，position 不能超过 positionLimit，需稍后重试。 */
     public static final long BACK_PRESSURED = -2;
 
-    /**
-     * The offer failed due to an administration action and should be retried.
-     * The action is an operation such as log rotation which is likely to have succeeded by the next retry attempt.
-     */
+    /** offer 失败：Driver 正在做管理操作（如 term 轮转），一般重试即可成功。 */
     public static final long ADMIN_ACTION = -3;
 
-    /**
-     * The {@link Publication} has been closed and should no longer be used.
-     */
+    /** Publication 已关闭，不可再使用。 */
     public static final long CLOSED = -4;
 
-    /**
-     * The offer failed due to reaching the maximum position of the stream given term buffer length times the total
-     * possible number of terms.
-     * <p>
-     * If this happens then the publication should be closed and a new one added. To make it less likely to happen then
-     * increase the term buffer length.
-     */
+    /** offer 失败：流已达到最大 position（term 长度 × 2^31），需关闭本 Publication 并重新 addPublication。 */
     public static final long MAX_POSITION_EXCEEDED = -5;
 
     final long originalRegistrationId;
@@ -274,9 +259,10 @@ public abstract class Publication implements AutoCloseable
     }
 
     /**
-     * Has the {@link Publication} seen an active Subscriber recently?
+     * 是否最近有活跃订阅者（Driver 通过 logMetaDataBuffer 中的连接状态维护）。
+     * 无订阅者时 offer 会返回 NOT_CONNECTED。
      *
-     * @return true if this {@link Publication} has recently seen an active subscriber otherwise false.
+     * @return 若有活跃订阅者为 true，否则 false。
      */
     public boolean isConnected()
     {
@@ -284,9 +270,8 @@ public abstract class Publication implements AutoCloseable
     }
 
     /**
-     * Remove resources used by this Publication when there are no more references.
-     * <p>
-     * Publications are reference counted and are only truly closed when the ref count reaches zero.
+     * 释放 Publication 占用的资源；内部通过 ClientConductor 向 Driver 发送 REMOVE_PUBLICATION 命令。
+     * Publication 有引用计数，仅当引用降为 0 时才真正关闭。
      */
     public void close()
     {
@@ -413,11 +398,10 @@ public abstract class Publication implements AutoCloseable
     public abstract long availableWindow();
 
     /**
-     * Non-blocking publish of a buffer containing a message.
+     * 非阻塞发送整块 buffer 中的消息；等价于 offer(buffer, 0, buffer.capacity())。
      *
-     * @param buffer containing message.
-     * @return The new stream position, otherwise a negative error value of {@link #NOT_CONNECTED},
-     * {@link #BACK_PRESSURED}, {@link #ADMIN_ACTION}, {@link #CLOSED}, or {@link #MAX_POSITION_EXCEEDED}.
+     * @param buffer 包含消息的 buffer。
+     * @return 成功时为新的流 position（单调递增），失败时为负值错误码（见类常量）。
      */
     public final long offer(final DirectBuffer buffer)
     {
@@ -425,13 +409,13 @@ public abstract class Publication implements AutoCloseable
     }
 
     /**
-     * Non-blocking publish of a partial buffer containing a message.
+     * 非阻塞发送 buffer 中 [offset, offset+length) 的消息；实际写入 Publication 的 term buffer，
+     * 由 Media Driver 的 Sender 线程从 term 中取数据发到网络。
      *
-     * @param buffer containing message.
-     * @param offset offset in the buffer at which the encoded message begins.
-     * @param length in bytes of the encoded message.
-     * @return The new stream position, otherwise a negative error value of {@link #NOT_CONNECTED},
-     * {@link #BACK_PRESSURED}, {@link #ADMIN_ACTION}, {@link #CLOSED}, or {@link #MAX_POSITION_EXCEEDED}.
+     * @param buffer 包含消息的 buffer。
+     * @param offset 消息起始偏移。
+     * @param length 消息字节长度。
+     * @return 成功时为新的流 position，失败时为 NOT_CONNECTED/BACK_PRESSURED/ADMIN_ACTION/CLOSED/MAX_POSITION_EXCEEDED 之一。
      */
     public final long offer(final DirectBuffer buffer, final int offset, final int length)
     {

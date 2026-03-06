@@ -624,9 +624,9 @@ public class CommonContext implements Cloneable
     }
 
     /**
-     * Convert the default Aeron directory name to be a random name for use with embedded drivers.
+     * 为嵌入式 Driver 生成随机目录名，格式为 "aeron-" + UUID，避免多实例共享同一目录。
      *
-     * @return random directory name with default directory name as base
+     * @return 以默认目录名为前缀的随机目录名
      */
     public static String generateRandomDirName()
     {
@@ -663,9 +663,10 @@ public class CommonContext implements Cloneable
     }
 
     /**
-     * Conclude the {@link #aeronDirectory()} so it does not need to keep being recreated.
+     * 收尾 aeron 目录：将 aeronDirectoryName 解析为规范路径的 File 并赋给 aeronDirectory，后续不再重复创建。
+     * MediaDriver 构造时首先调用此方法，以便 ensureDirectoryIsRecreated 等使用 ctx.aeronDirectory()。
      *
-     * @return this for a fluent API.
+     * @return this，支持链式调用。
      */
     public CommonContext concludeAeronDirectory()
     {

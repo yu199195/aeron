@@ -80,14 +80,15 @@ public final class ConcurrentPublication extends Publication
     }
 
     /**
-     * Non-blocking publish of a partial buffer containing a message.
+     * 非阻塞写入一条消息到当前 term buffer：先读 positionLimit（流控上限）、当前 term 与 tail，
+     * 若 position < limit 则按长度选择整条写入或分片写入，并 CAS 更新 tail；否则返回背压状态。
+     * 消息长度 ≤ maxPayloadLength 时单帧写入（appendUnfragmentedMessage），否则多帧（appendFragmentedMessage）。
      *
-     * @param buffer                containing message.
-     * @param offset                offset in the buffer at which the encoded message begins.
-     * @param length                in bytes of the encoded message.
-     * @param reservedValueSupplier {@link ReservedValueSupplier} for the frame.
-     * @return The new stream position, otherwise a negative error value of {@link #NOT_CONNECTED},
-     * {@link #BACK_PRESSURED}, {@link #ADMIN_ACTION}, {@link #CLOSED}, or {@link #MAX_POSITION_EXCEEDED}.
+     * @param buffer                消息所在 buffer。
+     * @param offset                消息起始偏移。
+     * @param length                消息字节长度。
+     * @param reservedValueSupplier 可选的帧 reserved 值提供者。
+     * @return 成功为新的 stream position，失败为 NOT_CONNECTED/BACK_PRESSURED/ADMIN_ACTION/CLOSED/MAX_POSITION_EXCEEDED。
      */
     public long offer(
         final DirectBuffer buffer,
@@ -98,18 +99,18 @@ public final class ConcurrentPublication extends Publication
         long newPosition = CLOSED;
         if (!isClosed)
         {
-            final long limit = positionLimit.getVolatile();
-            final int termCount = activeTermCount(logMetaDataBuffer);
-            final int index = indexByTermCount(termCount);
+            final long limit = positionLimit.getVolatile();           // 流控：不能超过订阅者通告的 limit
+            final int termCount = activeTermCount(logMetaDataBuffer);  // 当前活跃 term 序号
+            final int index = indexByTermCount(termCount);             // 对应 term buffer 下标（0/1/2）
             final UnsafeBuffer termBuffer = termBuffers[index];
             final int tailCounterOffset = TERM_TAIL_COUNTERS_OFFSET + (index * SIZE_OF_LONG);
-            final long rawTail = logMetaDataBuffer.getLongVolatile(tailCounterOffset);
+            final long rawTail = logMetaDataBuffer.getLongVolatile(tailCounterOffset);  // 当前 term 写入位
             final int termOffset = termOffset(rawTail, termBuffer.capacity());
             final int termId = termId(rawTail);
 
             if (termCount != (termId - initialTermId))
             {
-                return ADMIN_ACTION;
+                return ADMIN_ACTION;  // term 正在轮转，稍后重试
             }
 
             final long position = computePosition(termId, termOffset, positionBitsToShift, initialTermId);
@@ -130,7 +131,7 @@ public final class ConcurrentPublication extends Publication
             }
             else
             {
-                newPosition = backPressureStatus(position, length);
+                newPosition = backPressureStatus(position, length);   // 超 limit 则返回背压或 NOT_CONNECTED
             }
         }
 

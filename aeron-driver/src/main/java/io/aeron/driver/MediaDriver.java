@@ -112,26 +112,33 @@ public final class MediaDriver implements AutoCloseable
     }
 
     /**
-     * Construct a media driver with the given ctx.
+     * 使用给定 Context 构造 Media Driver（不启动线程）。完成：目录解析与清理、Socket 校验、
+     * Context 收尾（CnC 文件映射、计数器、Proxies）、三大 Agent 创建与注入、按线程模式创建 Runner/Invoker。
      *
-     * @param ctx for the media driver parameters
+     * @param ctx Media Driver 配置
      */
     private MediaDriver(final Context ctx)
     {
+        // 将 aeronDirectoryName 解析为 File：若 aeronDirectory 仍为 null，则 new File(aeronDirectoryName).getCanonicalFile()
         ctx.concludeAeronDirectory();
 
+        // 若目录已存在：根据配置检查是否有活跃 Driver、保存旧错误日志、删除目录；最后确保目录存在
         ensureDirectoryIsRecreated(ctx);
+        // 校验 SO_SNDBUF/SO_RCVBUF 与 MTU、initialWindowLength 等是否满足要求，不满足则抛 ConfigurationException
         validateSocketBufferLengths(ctx);
 
         try
         {
+            // 完成 Driver 侧配置：校验各项参数、创建并映射 CnC 文件、初始化 Counters/Proxies、标记 CnC ready 等
             ctx.conclude();
             this.ctx = ctx;
 
+            // 创建三大核心 Agent：Conductor 处理客户端命令与资源生命周期，Receiver 收包写 log，Sender 从 log 发包
             final DriverConductor conductor = new DriverConductor(ctx);
             final Receiver receiver = new Receiver(ctx);
             final Sender sender = new Sender(ctx);
 
+            // 将 Receiver/Sender 注入到 Context 的 Proxy，供 Conductor 等调用
             ctx.receiverProxy().receiver(receiver);
             ctx.senderProxy().sender(sender);
             ctx.driverConductorProxy().driverConductor(conductor);
@@ -139,9 +146,11 @@ public final class MediaDriver implements AutoCloseable
             final AtomicCounter errorCounter = ctx.systemCounters().get(ERRORS);
             final ErrorHandler errorHandler = ctx.errorHandler();
 
+            // 根据线程模式创建 AgentRunner（占一个线程）或 AgentInvoker（由外部调用 doWork）
             switch (ctx.threadingMode())
             {
                 case INVOKER:
+                    // 无专用线程：三个 Agent 打包成 NamedCompositeAgent，由 AgentInvoker 在调用方线程中执行
                     sharedInvoker = new AgentInvoker(
                         errorHandler,
                         errorCounter,
@@ -154,6 +163,7 @@ public final class MediaDriver implements AutoCloseable
                     break;
 
                 case SHARED:
+                    // 单线程：sender + receiver + conductor 在同一线程内轮流执行
                     sharedRunner = new AgentRunner(
                         ctx.sharedIdleStrategy(),
                         errorHandler,
@@ -167,6 +177,7 @@ public final class MediaDriver implements AutoCloseable
                     break;
 
                 case SHARED_NETWORK:
+                    // 两个线程：一个跑 sender+receiver，一个跑 conductor
                     sharedNetworkRunner = new AgentRunner(
                         ctx.sharedNetworkIdleStrategy(),
                         errorHandler,
@@ -182,6 +193,7 @@ public final class MediaDriver implements AutoCloseable
 
                 case DEDICATED:
                 default:
+                    // 默认：三个独立线程分别跑 Conductor、Sender、Receiver
                     senderRunner = new AgentRunner(ctx.senderIdleStrategy(), errorHandler, errorCounter, sender);
                     receiverRunner = new AgentRunner(ctx.receiverIdleStrategy(), errorHandler, errorCounter, receiver);
                     conductorRunner = new AgentRunner(
@@ -204,13 +216,10 @@ public final class MediaDriver implements AutoCloseable
     }
 
     /**
-     * Launch an isolated MediaDriver embedded in the current process with a generated aeronDirectoryName that can be
-     * retrieved by calling aeronDirectoryName.
-     * <p>
-     * If the aeronDirectoryName is set as a system property to something different from
-     * {@link CommonContext#AERON_DIR_PROP_DEFAULT} then this set value will be used.
+     * 在当前进程内启动嵌入式 Media Driver，使用自动生成的 aeron 目录名（可通过 {@link #aeronDirectoryName()} 获取）。
+     * 应用需将该目录名传给 {@link Aeron.Context#aeronDirectoryName(String)} 才能连接本 Driver。
      *
-     * @return the newly started MediaDriver.
+     * @return 新启动的 MediaDriver 实例。
      */
     public static MediaDriver launchEmbedded()
     {
@@ -218,23 +227,22 @@ public final class MediaDriver implements AutoCloseable
     }
 
     /**
-     * Launch an isolated MediaDriver embedded in the current process with a provided configuration ctx and a generated
-     * aeronDirectoryName (overwrites configured {@link Context#aeronDirectoryName()}) that can be retrieved by calling
-     * aeronDirectoryName.
-     * <p>
-     * If the aeronDirectoryName is set as a system property, or via context, to something different from
-     * {@link CommonContext#AERON_DIR_PROP_DEFAULT} then this set value will be used.
+     * 使用指定 Context 在当前进程内启动嵌入式 Media Driver；若 ctx 中目录名为默认值则会被改为随机目录名。
+     * DemoSender/DemoReceiver 中通过 {@code terminationHook(barrier::signalAll)} 在 Driver 收到关闭请求时唤醒 barrier。
      *
-     * @param ctx containing the configuration options.
-     * @return the newly started MediaDriver.
+     * @param ctx 配置（如 terminationHook、aeronDirectoryName 等）。
+     * @return 新启动的 MediaDriver 实例。
      */
     public static MediaDriver launchEmbedded(final Context ctx)
     {
+        // 若未显式设置目录名（仍为默认值 "aeron"），则改为随机目录名，避免多实例/多进程冲突
         if (CommonContext.AERON_DIR_PROP_DEFAULT.equals(ctx.aeronDirectoryName()))
         {
+            // 生成形如 "aeron-<UUID>" 的目录名，保证本进程内嵌入式 Driver 独占该目录
             ctx.aeronDirectoryName(CommonContext.generateRandomDirName());
         }
 
+        // 委托给 launch(ctx)：构造 MediaDriver、按线程模式启动各 Agent 线程并返回
         return launch(ctx);
     }
 
@@ -249,15 +257,20 @@ public final class MediaDriver implements AutoCloseable
     }
 
     /**
-     * Launch a MediaDriver embedded in the current process and provided a configuration ctx.
+     * 在当前进程内启动 Media Driver：先构造 MediaDriver（完成目录与 CnC 初始化、创建三大 Agent），
+     * 再根据 threadingMode 启动对应的工作线程或 Invoker，最后返回可用的 MediaDriver 实例。
      *
-     * @param ctx containing the configuration options.
-     * @return the newly created MediaDriver.
+     * @param ctx 配置（线程模式、目录、buffer 长度等）。
+     * @return 新创建并已启动的 MediaDriver。
      */
     public static MediaDriver launch(final Context ctx)
     {
+        // 1. 构造 MediaDriver：concludeAeronDirectory → ensureDirectoryIsRecreated → validateSocketBufferLengths
+        //    → ctx.conclude()（创建 CnC 文件、Counters、Proxies 等）→ 创建 DriverConductor/Receiver/Sender
+        //    → 根据 threadingMode 创建 AgentRunner 或 AgentInvoker（不启动线程）
         final MediaDriver mediaDriver = new MediaDriver(ctx);
 
+        // 2. Windows 下可选：启用高精度定时器，改善延迟
         if (ctx.useWindowsHighResTimer() && SystemUtil.isWindows())
         {
             mediaDriver.wasHighResTimerEnabled = HighResolutionTimer.isEnabled();
@@ -267,31 +280,27 @@ public final class MediaDriver implements AutoCloseable
             }
         }
 
+        // 3. 按线程模式启动 Agent（DEDICATED 模式会启动 conductor/sender/receiver 三个独立线程）
         if (null != mediaDriver.conductorRunner)
         {
             AgentRunner.startOnThread(mediaDriver.conductorRunner, ctx.conductorThreadFactory());
         }
-
         if (null != mediaDriver.senderRunner)
         {
             AgentRunner.startOnThread(mediaDriver.senderRunner, ctx.senderThreadFactory());
         }
-
         if (null != mediaDriver.receiverRunner)
         {
             AgentRunner.startOnThread(mediaDriver.receiverRunner, ctx.receiverThreadFactory());
         }
-
         if (null != mediaDriver.sharedNetworkRunner)
         {
             AgentRunner.startOnThread(mediaDriver.sharedNetworkRunner, ctx.sharedNetworkThreadFactory());
         }
-
         if (null != mediaDriver.sharedRunner)
         {
             AgentRunner.startOnThread(mediaDriver.sharedRunner, ctx.sharedThreadFactory());
         }
-
         if (null != mediaDriver.sharedInvoker)
         {
             mediaDriver.sharedInvoker.start();
@@ -340,16 +349,20 @@ public final class MediaDriver implements AutoCloseable
     }
 
     /**
-     * Used to access the configured aeronDirectoryName for this MediaDriver, typically used after the
-     * {@link #launchEmbedded()} method is used.
+     * 返回本 Driver 使用的 aeron 目录路径；嵌入式场景下 Client 必须用此值调用
+     * {@link Aeron.Context#aeronDirectoryName(String)} 才能与本 Driver 通信（共享 CnC 与 log 文件）。
      *
-     * @return the context aeronDirectoryName
+     * @return 配置的 aeron 目录名。
      */
     public String aeronDirectoryName()
     {
         return ctx.aeronDirectoryName();
     }
 
+    /**
+     * 确保 aeron 目录处于“可重新使用”状态：若目录已存在则根据配置决定是否检查旧 Driver、保存错误日志并删除目录；
+     * 最后保证目录存在（若不存在则创建）。
+     */
     private static void ensureDirectoryIsRecreated(final Context ctx)
     {
         if (ctx.aeronDirectory().isDirectory())
@@ -359,6 +372,7 @@ public final class MediaDriver implements AutoCloseable
                 System.err.println("WARNING: " + ctx.aeronDirectory() + " exists");
             }
 
+            // 若不强制删除（dirDeleteOnStart=false），则尝试映射已有 CnC 文件做检查
             if (!ctx.dirDeleteOnStart())
             {
                 final Consumer<String> logger = ctx.warnIfDirectoryExists() ? System.err::println : (s) -> {};
@@ -369,7 +383,6 @@ public final class MediaDriver implements AutoCloseable
                     {
                         throw new ActiveDriverException("active driver detected");
                     }
-
                     reportExistingErrors(ctx, cncByteBuffer);
                 }
                 finally
@@ -384,6 +397,9 @@ public final class MediaDriver implements AutoCloseable
         IoUtil.ensureDirectoryExists(ctx.aeronDirectory(), "aeron");
     }
 
+    /**
+     * 从已有 CnC 文件的 error buffer 中读取错误记录，若有则写入时间戳命名的 -error.log 文件并打印提示。
+     */
     private static void reportExistingErrors(final Context ctx, final MappedByteBuffer cncByteBuffer)
     {
         try
@@ -394,11 +410,9 @@ public final class MediaDriver implements AutoCloseable
             {
                 final StringBuilder builder = new StringBuilder(ctx.aeronDirectoryName());
                 IoUtil.removeTrailingSlashes(builder);
-
                 final SimpleDateFormat dateFormat = new SimpleDateFormat("-yyyy-MM-dd-HH-mm-ss-SSSZ");
                 builder.append(dateFormat.format(new Date())).append("-error.log");
                 final String errorLogFilename = builder.toString();
-
                 System.err.println("WARNING: Existing errors saved to: " + errorLogFilename);
                 try (FileOutputStream out = new FileOutputStream(errorLogFilename))
                 {
@@ -639,7 +653,9 @@ public final class MediaDriver implements AutoCloseable
         }
 
         /**
-         * {@inheritDoc}
+         * 完成 Media Driver Context 的收尾：继承父类 conclude、补全空属性与 OS Socket 缓冲长度，
+         * 校验 MTU/term 长度/窗口/超时等，创建并映射 CnC 文件，初始化 Counters 与 toDriver/toClients buffer，
+         * 最后标记 CnC ready 并刷盘。{@inheritDoc}
          */
         @SuppressWarnings("MethodLength")
         public Context conclude()
@@ -701,6 +717,7 @@ public final class MediaDriver implements AutoCloseable
                     "multicastFControlRetransmitReceiverWindowMultiple"
                 );
 
+                // CnC 文件长度 = 元数据 + conductor buffer + toClients buffer + counters 元数据/值 + error buffer，按 filePageSize 对齐
                 final long cncFileLength = BitUtil.align(
                     (long)META_DATA_LENGTH +
                     conductorBufferLength +
@@ -733,7 +750,7 @@ public final class MediaDriver implements AutoCloseable
 
                 toDriverCommands.nextCorrelationId();
                 toDriverCommands.consumerHeartbeatTime(epochClock.time());
-                CncFileDescriptor.signalCncReady(cncMetaDataBuffer);
+                CncFileDescriptor.signalCncReady(cncMetaDataBuffer);  // 通知 Client 可连接
                 cncByteBuffer.force();
             }
             catch (final Exception ex)
@@ -3123,10 +3140,10 @@ public final class MediaDriver implements AutoCloseable
         }
 
         /**
-         * Set the {@link Runnable} that is called when the {@link MediaDriver} processes a valid termination request.
+         * 设置 Driver 处理完合法关闭请求后会调用的回调（如 DemoSender 中的 barrier::signalAll，用于唤醒主线程退出）。
          *
-         * @param terminationHook that can be used to terminate a driver.
-         * @return this for a fluent API.
+         * @param terminationHook 关闭时执行的回调。
+         * @return this，支持链式调用。
          */
         public Context terminationHook(final Runnable terminationHook)
         {

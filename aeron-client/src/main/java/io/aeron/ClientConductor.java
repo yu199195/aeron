@@ -63,8 +63,8 @@ import static org.agrona.concurrent.status.CountersReader.NULL_COUNTER_ID;
 import static org.agrona.concurrent.status.CountersReader.RECORD_ALLOCATED;
 
 /**
- * Client conductor receives responses and notifications from Media Driver and acts on them in addition to forwarding
- * commands from the Client API to the Media Driver conductor.
+ * 客户端调度器：从 Media Driver 接收响应与事件（通过 toClientBuffer 的 broadcast），并转发 Client API 的命令到 Driver。
+ * 在独立线程或 AgentInvoker 中轮询 doWork()：处理 ADD_PUBLICATION/ADD_SUBSCRIPTION 的响应、AVAILABLE_IMAGE、心跳等。
  */
 final class ClientConductor implements Agent
 {
@@ -220,6 +220,10 @@ final class ClientConductor implements Agent
         }
     }
 
+    /**
+     * 执行一轮 Conductor 工作：加锁后调用 service() 处理 toClientBuffer 中的响应与事件
+     * （如 PUBLICATION_READY、SUBSCRIPTION_READY、AVAILABLE_IMAGE、心跳等），并驱动资源就绪。
+     */
     public int doWork()
     {
         int workCount = 0;
@@ -325,6 +329,10 @@ final class ClientConductor implements Agent
         }
     }
 
+    /**
+     * Driver 通过 toClientBuffer 通知：ADD_PUBLICATION 已就绪。根据 logFileName 映射 log buffers，
+     * 构造 ConcurrentPublication（含 positionLimit 等）并放入 resourceByRegIdMap，awaitResponse 即可返回。
+     */
     void onNewPublication(
         final long correlationId,
         final long registrationId,
@@ -396,6 +404,10 @@ final class ClientConductor implements Agent
         subscription.channelStatusId(statusIndicatorId);
     }
 
+    /**
+     * Driver 通知：某 Publisher 的流对本订阅可用。为 Subscription 创建 Image（绑定 logBuffers、subscriberPosition），
+     * 加入 subscription.images，并回调 availableImageHandler；接收端 poll 时从这些 Image 读数据。
+     */
     void onAvailableImage(
         final long correlationId,
         final int sessionId,
@@ -523,6 +535,10 @@ final class ClientConductor implements Agent
         }
     }
 
+    /**
+     * 同步添加 Publication：向 Driver 发送 ADD_PUBLICATION 命令，阻塞等待 Driver 返回 PUBLICATION_READY，
+     * 然后根据 logFileName 等构造 ConcurrentPublication（含 logBuffers、positionLimit）并放入 resourceByRegIdMap。
+     */
     ConcurrentPublication addPublication(final String channel, final int streamId)
     {
         clientLock.lock();
@@ -718,11 +734,16 @@ final class ClientConductor implements Agent
         }
     }
 
+    /** 使用 Context 默认的 Image 处理器添加订阅。 */
     Subscription addSubscription(final String channel, final int streamId)
     {
         return addSubscription(channel, streamId, defaultAvailableImageHandler, defaultUnavailableImageHandler);
     }
 
+    /**
+     * 同步添加 Subscription：向 Driver 发送 ADD_SUBSCRIPTION，等待 SUBSCRIPTION_READY；
+     * 之后当有 Publisher 连接时 Driver 会发 AVAILABLE_IMAGE，在此处 onAvailableImage 里为 subscription 添加 Image。
+     */
     Subscription addSubscription(
         final String channel,
         final int streamId,
