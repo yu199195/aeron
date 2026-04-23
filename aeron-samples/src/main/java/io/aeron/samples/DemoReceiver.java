@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>
  * 使用方式：先启动本程序，再启动 {@link DemoSender}。按 Ctrl+C 关闭。
  * <p>
- * 这份 demo 体现了 Aeron “应用线程拉取（poll）”的接收模型：
+ * 这份 demo 体现了 Aeron "应用线程拉取（poll）"的接收模型：
  * <ul>
  *     <li>网络收包、重组、写入 log buffer：由 Media Driver 的 receiver 线程完成。</li>
  *     <li>应用读取：由你的线程调用 {@link Subscription#poll(FragmentHandler, int)} 主动拉取。</li>
@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public class DemoReceiver
 {
-    private static final String CHANNEL = "aeron:udp?endpoint=localhost:40123";
+    private static final String CHANNEL = "aeron:udp?endpoint=172.23.39.208:9000";
     private static final int STREAM_ID = 10;
     private static final int FRAGMENT_LIMIT = 10;
 
@@ -77,39 +77,54 @@ public class DemoReceiver
                 final FragmentHandler handler = (buffer, offset, length, header) ->
                 {
                     /*
-                     * fragment：Aeron 在 log buffer 里存的是“帧（frame）”，大消息会被拆分为多个 fragment。
+                     * fragment：Aeron 在 log buffer 里存的是"帧（frame）"，大消息会被拆分为多个 fragment。
                      * 这个 demo 每次回调处理一个 fragment，并把它完整拷贝为 byte[] 再解码打印。
                      *
-                     * 想要“按原始消息重组”（例如超过 MTU 的大消息），通常会用 FragmentAssembler
+                     * 想要"按原始消息重组"（例如超过 MTU 的大消息），通常会用 FragmentAssembler
                      * 把同一条 message 的多个 fragment 组装成一次回调，再由应用处理。
                      */
-                    final byte[] bytes = new byte[length];
-                    buffer.getBytes(offset, bytes);
-                    final String message = new String(bytes, StandardCharsets.UTF_8);
-                    System.out.println("  [收到] " + message);
+                    final byte[] bytes = new byte[length];              // 分配 byte[] 接收 payload（demo 简单实现，生产环境应复用 buffer）
+                    buffer.getBytes(offset, bytes);                     // 从 termBuffer 中拷贝 payload 到 byte[]
+                    final String message = new String(bytes, StandardCharsets.UTF_8);    // UTF-8 解码为字符串
+                    System.out.println("  [收到] " + message);          // 打印收到的消息
                 };
 
                 /*
                  * Aeron 的接收通常写成 tight loop + idle strategy：
                  * - poll 返回读取到的 fragment 数
-                 * - idle strategy 根据“是否有工作”选择 spin/yield/sleep/backoff
+                 * - idle strategy 根据"是否有工作"选择 spin/yield/sleep/backoff
                  *
                  * 这里用 SleepingIdleStrategy(1ms) 是最省 CPU 的演示配置，但会引入额外延迟。
                  * 低延迟场景更常见 BusySpinIdleStrategy / BackoffIdleStrategy 等。
                  */
                 final SleepingIdleStrategy idle = new SleepingIdleStrategy(TimeUnit.MILLISECONDS.toNanos(1));
 
-                while (running.get())
+                while (running.get())                                   // 主循环：持续运行直到收到关闭信号
                 {
                     /*
-                     * subscription.poll 的核心语义：
-                     * - 最多处理 FRAGMENT_LIMIT 个 fragment
-                     * - 每处理一个 fragment 就回调 handler
+                     * subscription.poll(handler, FRAGMENT_LIMIT) 完整调用链：
                      *
-                     * 应用的“处理能力”会直接影响流控：处理得慢，position 推进慢，发送端就更容易 BACK_PRESSURED。
+                     * 1. Subscription.poll() — 入口
+                     *    - 获取 Image[] 快照（每个 Image 对应一个 Publisher session）
+                     *    - round-robin 轮询每个 Image，将剩余配额分配给各 Image
+                     *
+                     * 2. Image.poll() — 核心读取
+                     *    - 读取 subscriberPosition → 计算 term 内偏移 → 选择活跃 termBuffer
+                     *    - 循环扫描帧：frameLengthVolatile 读帧头长度
+                     *      > 0 → 帧已完成可读 | <= 0 → 到达写入前沿，退出
+                     *    - 跳过 padding 帧，对 data 帧回调 handler.onFragment()
+                     *    - finally：推进 subscriberPosition（release 语义）→ Driver 据此更新流控窗口
+                     *
+                     * 3. FragmentHandler.onFragment() — 业务回调
+                     *    - buffer: termBuffer 视图
+                     *    - offset: 跳过 32 字节帧头后的 payload 起始
+                     *    - length: payload 长度（= frameLength - HEADER_LENGTH）
+                     *    - header: 帧元数据（sessionId, streamId, termId, position 等）
+                     *
+                     * 流控影响：处理得慢 → position 推进慢 → 发送端 BACK_PRESSURED
                      */
-                    final int fragmentsRead = subscription.poll(handler, FRAGMENT_LIMIT);
-                    idle.idle(fragmentsRead);
+                    final int fragmentsRead = subscription.poll(handler, FRAGMENT_LIMIT);   // 最多读取 10 个 fragment
+                    idle.idle(fragmentsRead);                           // fragmentsRead > 0 不休眠，= 0 时 sleep 1ms 节省 CPU
                 }
             }
             System.out.println();

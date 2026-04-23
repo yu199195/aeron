@@ -18,7 +18,25 @@ package io.aeron.driver;
 import java.net.InetSocketAddress;
 
 /**
- * Strategy for applying congestion control to determine the receiver window length of the Status Messages.
+ * 【源码解析】CongestionControl —— 接收端拥塞控制策略接口。
+ * <p>
+ * 职责：在接收端动态计算 receiverWindowLength（接收窗口大小），
+ * 该值通过 Status Message（SM）反馈给发送端，从而控制发送速率。
+ * <p>
+ * 工作原理：
+ * 1. 接收端的 PublicationImage.trackRebuild() 被 Conductor 周期性调用
+ * 2. 调用 CongestionControl.onTrackRebuild() → 返回 receiverWindowLength
+ * 3. receiverWindowLength 写入下一个 SM 帧的 receiverWindowLength 字段
+ * 4. 发送端 FlowControl.onStatusMessage() 计算 senderLimit = consumptionPos + receiverWindowLength
+ * 5. 发送端 senderPosition < senderLimit 时才能发数据
+ * <p>
+ * 这形成了接收端驱动的端到端拥塞控制闭环。
+ * <p>
+ * 内置实现：
+ * - StaticWindowCongestionControl：固定窗口（默认），不动态调整
+ * - CubicCongestionControl（aeron-driver 额外模块）：类 TCP CUBIC 算法，根据 RTT 和丢包动态调整
+ * <p>
+ * 可插拔：通过 MediaDriver.Context.congestionControlSupplier() 配置。
  */
 public interface CongestionControl extends AutoCloseable
 {
@@ -99,19 +117,21 @@ public interface CongestionControl extends AutoCloseable
     void onRttMeasurement(long nowNs, long rttNs, InetSocketAddress srcAddress);
 
     /**
-     * Called by {@link DriverConductor} upon execution of {@link PublicationImage#trackRebuild(long)} to
-     * pass on current status.
+     * 【核心方法】由 Conductor 在 PublicationImage.trackRebuild() 中调用，
+     * 根据当前接收状态计算新的 receiverWindowLength。
      * <p>
-     * The return value must be packed using {@link CongestionControl#packOutcome(int, boolean)}.
+     * 拥塞控制算法的输入：
+     * - newConsumptionPosition：订阅者已消费到的位置
+     * - lastSmPosition：上次 SM 发送时的位置
+     * - hwmPosition：接收到的最高水位线
+     * - startingRebuildPosition / endingRebuildPosition：本轮重建进度
+     * - lossOccurred：本轮是否检测到丢包
+     * <p>
+     * 返回值打包：packOutcome(receiverWindowLength, forceStatusMessage)
+     * - receiverWindowLength：放入 SM 反馈给发送端
+     * - forceStatusMessage：true 则立即发 SM（例如窗口大小突变时）
      *
-     * @param nowNs                   current time
-     * @param newConsumptionPosition  of the subscribers
-     * @param lastSmPosition          of the image
-     * @param hwmPosition             of the image
-     * @param startingRebuildPosition of the rebuild
-     * @param endingRebuildPosition   of the rebuild
-     * @param lossOccurred            during rebuild
-     * @return outcome of congestion control calculation containing window length and whether to force sending an SM.
+     * @return 打包的拥塞控制结果
      */
     long onTrackRebuild(
         long nowNs,

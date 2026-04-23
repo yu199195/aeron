@@ -129,20 +129,29 @@ public final class Archive implements AutoCloseable
     {
         try
         {
+            // 构造入口只做两类事：
+            // - ctx.conclude()：对 Context 做“冻结”（校验 + 补默认值 + 初始化底层资源，如 mark file / counters 等）
+            // - 按 threadingMode 选择 conductor 的实现与驱动方式（线程 runner 或外部 invoker）
             ctx.conclude();
             this.ctx = ctx;
 
+            // 根据 threadingMode 创建 conductor：
+            // - DEDICATED：conductor/recorder/replayer 往往各有专用线程（吞吐与隔离更好）
+            // - SHARED/INVOKER：共享或外部驱动（更省线程，适合嵌入式/测试/统一调度）
             final ArchiveConductor conductor = DEDICATED == ctx.threadingMode() ?
                 (new DedicatedModeArchiveConductor(ctx)) : (new SharedModeArchiveConductor(ctx));
 
             if (ArchiveThreadingMode.INVOKER == ctx.threadingMode())
             {
+                // INVOKER：不启动线程，由外部调用 invoker.invoke() 驱动 conductor。
+                // 典型场景：与 MediaDriver 一样被某个统一的调度线程“tick”驱动，减少线程数量与上下文切换。
                 conductorInvoker = new AgentInvoker(ctx.errorHandler(), ctx.errorCounter(), conductor);
                 conductorRunner = null;
             }
             else
             {
                 conductorInvoker = null;
+                // SHARED/DEDICATED：使用 AgentRunner 在独立线程上运行 conductor 的 doWork() 循环。
                 conductorRunner = new AgentRunner(
                     ctx.idleStrategy(), ctx.errorHandler(), ctx.errorCounter(), conductor);
             }
@@ -156,6 +165,7 @@ public final class Archive implements AutoCloseable
             final ArchiveMarkFile markFile = ctx.markFile;
             if (null != markFile)
             {
+                // 构造失败时，mark file 需要从“ready/initialising”切回非 ready 状态，避免外部误判 Archive 正常启动。
                 markFile.signalReady(NULL_VALUE);
             }
             CloseHelper.quietClose(ctx::close);
@@ -236,18 +246,22 @@ public final class Archive implements AutoCloseable
     /**
      * Launch an Archive by providing a configuration context.
      *
-     * @param ctx for the configuration parameters.
+     * @param ctx for the configuration parameters (e.g. mediaDriverAgentInvoker, aeronDirectoryName,
+     *            errorHandler, errorCounter from ArchivingMediaDriver).
      * @return a new instance of an Archive.
      */
     public static Archive launch(final Context ctx)
     {
+        // 1. 构造 Archive：ctx.conclude() 校验并填充参数；按 threadingMode 创建 conductor
         final Archive archive = new Archive(ctx);
         if (ArchiveThreadingMode.INVOKER == ctx.threadingMode())
         {
+            // INVOKER 模式：由外部线程调用 invoker.invoke() 驱动，不启动新线程
             archive.conductorInvoker.start();
         }
         else
         {
+            // SHARED/DEDICATED：启动独立线程运行 conductorRunner
             AgentRunner.startOnThread(archive.conductorRunner, ctx.threadFactory());
         }
 
@@ -1167,21 +1181,25 @@ public final class Archive implements AutoCloseable
 
         /**
          * Conclude the configuration parameters by resolving dependencies and null values to use defaults.
+         * 校验配置、填充默认值、创建 Aeron 客户端、Catalog、MarkFile、各类 Counters 等。
          */
         @SuppressWarnings("MethodLength")
         public void conclude()
         {
+            // 防止重复 conclude
             if ((boolean)IS_CONCLUDED_VH.getAndSet(this, true))
             {
                 throw new ConcurrentConcludeException();
             }
 
+            // 校验 file sync 级别：catalog 的 sync 不能弱于普通文件的 sync
             if (catalogFileSyncLevel < fileSyncLevel)
             {
                 throw new ConfigurationException(
                     "catalogFileSyncLevel " + catalogFileSyncLevel + " < fileSyncLevel " + fileSyncLevel);
             }
 
+            // 校验 fileIoMaxLength：必须 >= TERM_MIN_LENGTH 且为 2 的幂
             if (fileIoMaxLength < TERM_MIN_LENGTH || !BitUtil.isPowerOfTwo(fileIoMaxLength))
             {
                 throw new ConfigurationException("invalid fileIoMaxLength=" + fileIoMaxLength);
@@ -1190,6 +1208,7 @@ public final class Archive implements AutoCloseable
             io.aeron.driver.Configuration.validateMtuLength(controlMtuLength);
             checkTermLength(controlTermBufferLength);
 
+            // 若启用 controlChannel，则必须为 UDP 且已显式设置
             if (controlChannelEnabled)
             {
                 if (null == controlChannel)
@@ -1201,14 +1220,16 @@ public final class Archive implements AutoCloseable
                 {
                     throw new ConfigurationException(
                         "Archive.Context.controlChannel must be UDP media: uri=" + controlChannel);
-                }
+            }
             }
 
+            // localControlChannel 必须为 IPC（进程内通信）
             if (!localControlChannel.startsWith(CommonContext.IPC_CHANNEL))
             {
                 throw new ConfigurationException("local control channel must be IPC media: uri=" + localControlChannel);
             }
 
+            // replicationChannel 用于 Archive 间复制，必须设置
             if (null == replicationChannel)
             {
                 throw new ConfigurationException("Archive.Context.replicationChannel must be set");
@@ -1221,6 +1242,9 @@ public final class Archive implements AutoCloseable
                     "Archive.Context.recordingEventsEnabled is true");
             }
 
+            // 若 ArchivingMediaDriver 注入了 mediaDriverAgentInvoker，则必须使用 INVOKER 模式，
+            // 以便 Archive 与 MediaDriver 共享同一 Agent 调用链（conductor 在 invoke 中调用 driverAgentInvoker.invoke()）
+            // 以便 Archive 与 MediaDriver 共享同一 Agent 调用链（conductor 在 invoke 中调用 driverAgentInvoker.invoke()）
             if (null != mediaDriverAgentInvoker && ArchiveThreadingMode.INVOKER != threadingMode)
             {
                 throw new ConfigurationException(
@@ -1228,17 +1252,20 @@ public final class Archive implements AutoCloseable
                     "Archive.Context.mediaDriverAgentInvoker is set");
             }
 
+            // 目录：archiveDir 未设则用 archiveDirectoryName 创建 File
             if (null == archiveDir)
             {
                 archiveDir = new File(archiveDirectoryName);
             }
 
+            // markFileDir 未设则用配置或 archiveDir
             if (null == markFileDir)
             {
                 final String markFileDirPath = Configuration.markFileDir();
                 markFileDir = !Strings.isEmpty(markFileDirPath) ? new File(markFileDirPath) : archiveDir;
             }
 
+            // 规范化路径为绝对路径
             try
             {
                 archiveDir = archiveDir.getCanonicalFile();
@@ -1250,6 +1277,7 @@ public final class Archive implements AutoCloseable
                 throw new UncheckedIOException(e);
             }
 
+            // 若配置了启动时删除，则清空 archive 目录（常用于测试）
             if (deleteArchiveOnStart)
             {
                 IoUtil.delete(archiveDir, false);
@@ -1258,8 +1286,10 @@ public final class Archive implements AutoCloseable
             IoUtil.ensureDirectoryExists(archiveDir, "archive");
             IoUtil.ensureDirectoryExists(markFileDir, "mark file");
 
+            // 获取目录 FileChannel，用于目录级别 fsync
             archiveDirChannel = channelForDirectorySync(archiveDir, catalogFileSyncLevel);
 
+            // 获取 archive 目录所在文件系统信息
             if (null == archiveFileStore)
             {
                 try
@@ -1272,6 +1302,7 @@ public final class Archive implements AutoCloseable
                 }
             }
 
+            // 时钟：未设则用系统默认
             if (null == epochClock)
             {
                 epochClock = SystemEpochClock.INSTANCE;
@@ -1282,6 +1313,7 @@ public final class Archive implements AutoCloseable
                 nanoClock = SystemNanoClock.INSTANCE;
             }
 
+            // aeronDirectoryName：若已传入 Aeron 实例则从其取；否则用 ArchivingMediaDriver 传入的 driverCtx.aeronDirectoryName()
             if (null != aeron)
             {
                 aeronDirectoryName = aeron.context().aeronDirectoryName();
@@ -1289,6 +1321,7 @@ public final class Archive implements AutoCloseable
 
             concludeArchiveId();
 
+            // 创建 ArchiveMarkFile：用于标记 archive 就绪、存储错误日志等
             if (null == markFile)
             {
                 if (errorBufferLength < ERROR_BUFFER_LENGTH_DEFAULT ||
@@ -1300,11 +1333,13 @@ public final class Archive implements AutoCloseable
                 markFile = new ArchiveMarkFile(this);
             }
 
+            // 在 archive 目录下创建指向 mark 文件的软链接
             MarkFile.ensureMarkFileLink(
                 archiveDir,
                 new File(markFile.parentDirectory(), ArchiveMarkFile.FILENAME),
                 ArchiveMarkFile.LINK_FILENAME);
 
+            // 使用 ArchivingMediaDriver 传入的 errorHandler，或已有值；包装成 DistinctErrorLog
             errorHandler = CommonContext.setupErrorHandler(
                 errorHandler, new DistinctErrorLog(markFile.errorBuffer(), epochClock, US_ASCII));
 
@@ -1315,6 +1350,8 @@ public final class Archive implements AutoCloseable
             {
                 ownsAeronClient = true;
 
+                // 创建 Aeron 客户端：aeronDirectoryName 与 MediaDriver 同目录；
+                // driverAgentInvoker 即 mediaDriverAgentInvoker，使 Aeron 与 MediaDriver 共享同一 invoke 调用链
                 aeron = Aeron.connect(
                     new Aeron.Context()
                         .aeronDirectoryName(aeronDirectoryName)
@@ -1328,6 +1365,7 @@ public final class Archive implements AutoCloseable
                         .clientLock(NoOpLock.INSTANCE)
                         .clientName(clientName));
 
+                // errorCounter：ArchivingMediaDriver 若未提供则在此分配；若提供则复用 driver 的 countersValuesBuffer
                 if (null == errorCounter)
                 {
                     if (NULL_VALUE !=
@@ -1338,6 +1376,7 @@ public final class Archive implements AutoCloseable
                     errorCounter = ArchiveCounters.allocateErrorCounter(aeron, tempBuffer, archiveId);
                 }
             }
+            // 外部传入的 Aeron 必须使用 ConductorAgentInvoker（以便与 driver 同线程调度）
             else if (!aeron.context().useConductorAgentInvoker())
             {
                 throw new ArchiveException(
@@ -1351,11 +1390,13 @@ public final class Archive implements AutoCloseable
 
             Objects.requireNonNull(errorCounter, "Error counter must be supplied if aeron client is");
 
+            // 用 errorHandler 与 errorCounter 包装成 CountedErrorHandler，统一错误处理与计数
             if (null == countedErrorHandler)
             {
                 countedErrorHandler = new CountedErrorHandler(errorHandler, errorCounter);
             }
 
+            // 线程工厂与 idle 策略：未设则用默认
             if (null == threadFactory)
             {
                 threadFactory = Thread::new;
@@ -1376,6 +1417,7 @@ public final class Archive implements AutoCloseable
                 idleStrategySupplier = Configuration.idleStrategySupplier(null);
             }
 
+            // conductor 的 DutyCycleTracker：监控 cycle 耗时，超阈值时计数
             if (null == conductorDutyCycleTracker)
             {
                 conductorDutyCycleTracker = new DutyCycleStallTracker(
@@ -1395,6 +1437,7 @@ public final class Archive implements AutoCloseable
                     conductorCycleThresholdNs);
             }
 
+            // DEDICATED 模式下：recorder、replayer 各有独立线程，需单独 idle 策略与 DutyCycleTracker
             if (DEDICATED == threadingMode)
             {
                 if (null == recorderIdleStrategySupplier)
@@ -1454,6 +1497,7 @@ public final class Archive implements AutoCloseable
                 }
             }
 
+            // segmentFileLength 必须为 2 的幂，且在 TERM_MIN_LENGTH～TERM_MAX_LENGTH 范围内
             if (!isPowerOfTwo(segmentFileLength))
             {
                 throw new ArchiveException("segment file length not a power of 2: " + segmentFileLength);
@@ -1463,6 +1507,7 @@ public final class Archive implements AutoCloseable
                 throw new ArchiveException("segment file length not in valid range: " + segmentFileLength);
             }
 
+            // 认证与授权：未设则用配置默认（通常为空实现）
             if (null == authenticatorSupplier)
             {
                 authenticatorSupplier = Configuration.authenticatorSupplier();
@@ -1476,6 +1521,7 @@ public final class Archive implements AutoCloseable
             concludeRecordChecksum();
             concludeReplayChecksum();
 
+            // 创建 Catalog：管理录制元数据（recording 索引、segment 文件等）
             if (null == catalog)
             {
                 catalog = new Catalog(
@@ -1488,11 +1534,13 @@ public final class Archive implements AutoCloseable
                     null != recordChecksum ? recordChecksumBuffer() : dataBuffer());
             }
 
+            // Archive 内部用于连接自身的 AeronArchive Context（如 replication 等场景）
             if (null == archiveClientContext)
             {
                 archiveClientContext = new AeronArchive.Context();
             }
 
+            // 若未显式设置 controlResponseChannel，则根据 controlChannel 的 endpoint 推导（host:0）
             if (null == archiveClientContext.controlResponseChannel())
             {
                 if (controlChannelEnabled)
@@ -1519,6 +1567,7 @@ public final class Archive implements AutoCloseable
                 }
                 else
                 {
+                    // controlChannel 未启用时，必须显式设置 controlResponseChannel
                     throw new ConfigurationException(
                         "Archive.Context.archiveClientContext.controlResponseChannel must be set if " +
                             "Archive.Context.controlChannelEnabled is false"
@@ -1532,6 +1581,7 @@ public final class Archive implements AutoCloseable
                 .errorHandler(errorHandler)
                 .clientName(clientName);
 
+            // 分配各类 Counters：control sessions、recording sessions、replay sessions、IO 统计等
             if (null == controlSessionsCounter)
             {
                 controlSessionsCounter = ArchiveCounters.allocate(
@@ -1635,10 +1685,12 @@ public final class Archive implements AutoCloseable
             }
             validateCounterTypeId(aeron, totalReadTimeCounter, ARCHIVE_REPLAYER_TOTAL_READ_TIME_TYPE_ID);
 
+            // abortLatch：DEDICATED 时 recorder+replayer 各 1；conductor 无 invoker 时再加 1
             int expectedCount = DEDICATED == threadingMode ? 2 : 0;
             expectedCount += aeron.conductorAgentInvoker() == null ? 1 : 0;
             abortLatch = new CountDownLatch(expectedCount);
 
+            // 标记 Archive 已就绪，外部可检测
             markFile.signalReady(epochClock.time());
 
             if (CommonContext.shouldPrintConfigurationOnStart())

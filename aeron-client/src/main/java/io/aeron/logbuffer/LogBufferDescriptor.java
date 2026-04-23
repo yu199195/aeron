@@ -603,14 +603,17 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Get whether the log is considered connected or not by the driver.
+     * 【读取连接状态】从 log metadata 中以 volatile 语义读取 isConnected 标志。
+     * Driver 在检测到有活跃订阅者（收到 SM 状态消息）时将此标志设为 1；
+     * Publication.offer 中 backPressureStatus 用它区分 BACK_PRESSURED 与 NOT_CONNECTED。
      *
      * @param metadataBuffer containing the meta data.
      * @return whether the log is considered connected or not by the driver.
      */
     public static boolean isConnected(final UnsafeBuffer metadataBuffer)
     {
-        return metadataBuffer.getIntVolatile(LOG_IS_CONNECTED_OFFSET) == 1;
+        return metadataBuffer.getIntVolatile(LOG_IS_CONNECTED_OFFSET)   // volatile 读取 metadata 中 isConnected 字段
+            == 1;                                                       // 1 = 已连接（Driver 收到订阅者 SM 后设置），0 = 未连接
     }
 
     /**
@@ -669,15 +672,17 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Get the value of the active term count used by the producer of this log. Consumers may have a different
-     * active term count if they are running behind. The read is done with volatile semantics.
+     * 【读取当前活跃 term 计数】以 volatile 语义从 log metadata 读取 activeTermCount。
+     * Producer 用它确定当前应写入哪个 term partition（indexByTermCount(termCount)）。
+     * term 轮转时由 rotateLog 通过 CAS 递增。
      *
      * @param metadataBuffer containing the meta data.
      * @return the value of the active term count used by the producer of this log.
      */
     public static int activeTermCount(final UnsafeBuffer metadataBuffer)
     {
-        return metadataBuffer.getIntVolatile(LOG_ACTIVE_TERM_COUNT_OFFSET);
+        return metadataBuffer.getIntVolatile(                           // volatile 读取 metadata 中 activeTermCount 字段
+            LOG_ACTIVE_TERM_COUNT_OFFSET);                              // 表示当前生产者正在使用的 term 序号（从 0 开始递增）
     }
 
     /**
@@ -740,14 +745,15 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Determine the partition index based on number of terms that have passed.
+     * 【termCount → partition 下标】Aeron 使用 3 个 term buffer 轮转（PARTITION_COUNT=3），
+     * 此方法将 termCount 对 3 取模得到对应 partition 下标（0/1/2）。
      *
      * @param termCount for the number of terms that have passed.
      * @return the partition index for the term count.
      */
     public static int indexByTermCount(final long termCount)
     {
-        return (int)(termCount % PARTITION_COUNT);
+        return (int)(termCount % PARTITION_COUNT);                      // termCount 对 3 取模 → partition 下标（0/1/2），3 个 term buffer 循环使用
     }
 
     /**
@@ -763,7 +769,9 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Compute the current position in absolute number of bytes.
+     * 【计算绝对 position】将 (termId, termOffset) 转换为流的绝对字节位置。
+     * position = (activeTermId - initialTermId) << positionBitsToShift + termOffset
+     * 即 termCount * termLength + termOffset。offer 成功后返回的就是这个值。
      *
      * @param activeTermId        active term id.
      * @param termOffset          in the term.
@@ -774,9 +782,9 @@ public class LogBufferDescriptor
     public static long computePosition(
         final int activeTermId, final int termOffset, final int positionBitsToShift, final int initialTermId)
     {
-        final long termCount = activeTermId - initialTermId; // copes with negative activeTermId on rollover
+        final long termCount = activeTermId - initialTermId;            // 当前 termId 减去初始 termId = 已经过的 term 数（int 减法天然处理溢出）
 
-        return (termCount << positionBitsToShift) + termOffset;
+        return (termCount << positionBitsToShift) + termOffset;         // termCount * termLength + termOffset = 绝对字节位置
     }
 
     /**
@@ -843,14 +851,17 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Get a wrapper around the default frame header from the log metadata.
+     * 【获取默认帧头模板】从 log metadata 中取出预填充的帧头（含版本、类型、sessionId、streamId 等），
+     * 供 HeaderWriter 初始化使用——后续每次写帧头只需在此模板基础上填入 termId、offset 和 length。
      *
      * @param metadataBuffer containing the raw bytes for the default frame header.
      * @return a buffer wrapping the raw bytes.
      */
     public static UnsafeBuffer defaultFrameHeader(final UnsafeBuffer metadataBuffer)
     {
-        return new UnsafeBuffer(metadataBuffer, LOG_DEFAULT_FRAME_HEADER_OFFSET, HEADER_LENGTH);
+        return new UnsafeBuffer(                                        // 从 metadata buffer 中切出 32 字节的默认帧头模板
+            metadataBuffer, LOG_DEFAULT_FRAME_HEADER_OFFSET,            //   起始偏移: LOG_DEFAULT_FRAME_HEADER_OFFSET
+            HEADER_LENGTH);                                             //   长度: 32 字节（DataHeader 大小）
     }
 
     /**
@@ -867,9 +878,11 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Rotate the log and update the tail counter for the new term.
-     * <p>
-     * This method is safe for concurrent use.
+     * 【term 轮转】当前 term 写满后，将 activeTermCount 推进到下一个 term。线程安全（使用 CAS）。
+     * 步骤：
+     * 1. 计算下一个 term 的 index（(termCount+1) % 3）
+     * 2. CAS 将该 partition 的 rawTail 从旧 termId 更新为 (termId+1, offset=0)
+     * 3. CAS 推进 activeTermCount，确保只有一个线程成功完成轮转
      *
      * @param metadataBuffer for the log.
      * @param termCount      from which to rotate.
@@ -878,23 +891,25 @@ public class LogBufferDescriptor
      */
     public static boolean rotateLog(final UnsafeBuffer metadataBuffer, final int termCount, final int termId)
     {
-        final int nextTermId = termId + 1;
-        final int nextTermCount = termCount + 1;
-        final int nextIndex = indexByTermCount(nextTermCount);
-        final int expectedTermId = nextTermId - PARTITION_COUNT;
+        final int nextTermId = termId + 1;                              // 下一个 term 的 termId = 当前 + 1
+        final int nextTermCount = termCount + 1;                        // 下一个 term 的 termCount = 当前 + 1
+        final int nextIndex = indexByTermCount(nextTermCount);          // 下一个 term 的 partition 下标 = (termCount+1) % 3
+        final int expectedTermId = nextTermId - PARTITION_COUNT;        // 预期的旧 termId（3 个 term 前使用该 partition 时的 termId）
 
         long rawTail;
         do
         {
-            rawTail = rawTailVolatile(metadataBuffer, nextIndex);
-            if (expectedTermId != termId(rawTail))
+            rawTail = rawTailVolatile(metadataBuffer, nextIndex);       // volatile 读取目标 partition 当前的 rawTail
+            if (expectedTermId != termId(rawTail))                      // 若 termId 不符合预期，说明该 partition 已被其他线程更新过
             {
-                break;
+                break;                                                  // 跳出循环，无需再 CAS（避免重复轮转）
             }
         }
-        while (!casRawTail(metadataBuffer, nextIndex, rawTail, packTail(nextTermId, 0)));
+        while (!casRawTail(metadataBuffer, nextIndex,                   // CAS 将目标 partition 的 rawTail 从旧值更新为 (nextTermId, offset=0)
+            rawTail, packTail(nextTermId, 0)));                         //   packTail 将 termId 放高 32 位、offset=0 放低 32 位
 
-        return casActiveTermCount(metadataBuffer, termCount, nextTermCount);
+        return casActiveTermCount(metadataBuffer, termCount,            // CAS 推进 activeTermCount 从 termCount → termCount+1
+            nextTermCount);                                             //   只有一个线程能成功，返回 true 表示本线程完成了轮转
     }
 
     /**
@@ -911,18 +926,20 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Get the termId from a packed raw tail value.
+     * 【从 rawTail 中提取 termId】rawTail 是一个 64 位值：高 32 位 = termId，低 32 位 = termOffset。
+     * 右移 32 位即可得到 termId。
      *
      * @param rawTail containing the termId.
      * @return the termId from a packed raw tail value.
      */
     public static int termId(final long rawTail)
     {
-        return (int)(rawTail >> 32);
+        return (int)(rawTail >> 32);                                    // rawTail 高 32 位 = termId（右移 32 位截断为 int）
     }
 
     /**
-     * Read the termOffset from a packed raw tail value.
+     * 【从 rawTail 中提取 termOffset】取低 32 位并限制不超过 termLength。
+     * 由于多线程 FAA 可能导致 tail 超过 termLength，用 Math.min 截断。
      *
      * @param rawTail    containing the termOffset.
      * @param termLength that the offset cannot exceed.
@@ -930,9 +947,9 @@ public class LogBufferDescriptor
      */
     public static int termOffset(final long rawTail, final long termLength)
     {
-        final long tail = rawTail & 0xFFFF_FFFFL;
+        final long tail = rawTail & 0xFFFF_FFFFL;                      // 取低 32 位作为无符号 offset
 
-        return (int)Math.min(tail, termLength);
+        return (int)Math.min(tail, termLength);                         // 截断不超过 termLength（多线程 FAA 可能导致 tail 越界）
     }
 
     /**
@@ -995,7 +1012,7 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Get the raw value of the tail for the given partition.
+     * 【读取指定 partition 的 rawTail】以 volatile 语义读取指定 partition 的 tail counter（高 32 位 termId + 低 32 位 offset）。
      *
      * @param metadataBuffer containing the tail counters.
      * @param partitionIndex for the tail counter.
@@ -1003,19 +1020,23 @@ public class LogBufferDescriptor
      */
     public static long rawTailVolatile(final UnsafeBuffer metadataBuffer, final int partitionIndex)
     {
-        return metadataBuffer.getLongVolatile(TERM_TAIL_COUNTERS_OFFSET + (SIZE_OF_LONG * partitionIndex));
+        return metadataBuffer.getLongVolatile(                          // volatile 读取指定 partition 的 rawTail
+            TERM_TAIL_COUNTERS_OFFSET + (SIZE_OF_LONG * partitionIndex));
     }
 
     /**
-     * Get the raw value of the tail for the current active partition.
+     * 【读取当前活跃 partition 的 rawTail】先通过 activeTermCount 确定当前 partition 下标，
+     * 再以 volatile 语义读取对应的 tail counter。Publication.position() 用此方法获取当前写入位。
      *
      * @param metadataBuffer containing the tail counters.
      * @return the raw value of the tail for the current active partition.
      */
     public static long rawTailVolatile(final UnsafeBuffer metadataBuffer)
     {
-        final int partitionIndex = indexByTermCount(activeTermCount(metadataBuffer));
-        return metadataBuffer.getLongVolatile(TERM_TAIL_COUNTERS_OFFSET + (SIZE_OF_LONG * partitionIndex));
+        final int partitionIndex =                                      // 先读 activeTermCount 再取模得到当前 partition 下标
+            indexByTermCount(activeTermCount(metadataBuffer));
+        return metadataBuffer.getLongVolatile(                          // volatile 读取该 partition 的 rawTail（高32=termId, 低32=offset）
+            TERM_TAIL_COUNTERS_OFFSET + (SIZE_OF_LONG * partitionIndex));
     }
 
     /**
@@ -1067,7 +1088,9 @@ public class LogBufferDescriptor
     }
 
     /**
-     * Compute frame length for a message that is fragmented into chunks of {@code maxPayloadSize}.
+     * 【计算分片后总帧长】将一条消息按 maxPayloadSize 拆分为多个 fragment，
+     * 每个 fragment 需要额外的 HEADER_LENGTH 帧头开销，末尾 fragment 需按 FRAME_ALIGNMENT 对齐。
+     * appendFragmentedMessage 用此方法一次性计算需在 term 中预留的总空间。
      *
      * @param length         of the message.
      * @param maxPayloadSize fragment size without the header.
@@ -1075,12 +1098,14 @@ public class LogBufferDescriptor
      */
     public static int computeFragmentedFrameLength(final int length, final int maxPayloadSize)
     {
-        final int numMaxPayloads = length / maxPayloadSize;
-        final int remainingPayload = length % maxPayloadSize;
-        final int lastFrameLength =
-            remainingPayload > 0 ? align(remainingPayload + HEADER_LENGTH, FRAME_ALIGNMENT) : 0;
+        final int numMaxPayloads = length / maxPayloadSize;             // 满载 fragment 数量（每个 fragment payload = maxPayloadSize）
+        final int remainingPayload = length % maxPayloadSize;           // 最后一个不满载 fragment 的 payload 长度
+        final int lastFrameLength =                                     // 最后一个 fragment 的对齐后帧长（若无剩余则为 0）
+            remainingPayload > 0
+                ? align(remainingPayload + HEADER_LENGTH, FRAME_ALIGNMENT) : 0;
 
-        return (numMaxPayloads * (maxPayloadSize + HEADER_LENGTH)) + lastFrameLength;
+        return (numMaxPayloads * (maxPayloadSize + HEADER_LENGTH))      // 满载 fragment 总长（每个 = payload + 帧头，天然对齐）
+            + lastFrameLength;                                          // + 末尾 fragment 帧长 = 分片后需在 term 中预留的总空间
     }
 
     /**

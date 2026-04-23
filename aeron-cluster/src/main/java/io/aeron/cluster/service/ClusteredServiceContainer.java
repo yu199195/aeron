@@ -107,27 +107,69 @@ public final class ClusteredServiceContainer implements AutoCloseable
     private final Context ctx;
     private final AgentRunner serviceAgentRunner;
 
+    /**
+     * ClusteredServiceContainer 构造函数：初始化配置并创建 Service Agent。
+     * <p>
+     * 执行流程：
+     * <ol>
+     *   <li>调用 ctx.conclude() 完成配置初始化</li>
+     *   <li>创建 ClusteredServiceAgent（Service 业务逻辑执行者）</li>
+     *   <li>创建 AgentRunner（准备在独立线程上运行）</li>
+     * </ol>
+     *
+     * @param ctx 配置上下文
+     * @throws ConcurrentConcludeException 如果配置已被并发初始化
+     * @throws Exception 如果初始化失败，标记 Mark File 为失败状态
+     */
     private ClusteredServiceContainer(final Context ctx)
     {
+        // ==================== 保存配置上下文 ====================
         this.ctx = ctx;
 
         try
         {
-            ctx.conclude();
+            // ==================== 步骤 1: 配置初始化（核心逻辑） ====================
+            // conclude() 负责：
+            // - 校验配置参数（serviceId、clusterId 等）
+            // - 创建工作目录
+            // - 连接到 Aeron
+            // - 分配计数器
+            ctx.conclude();  // ← 详见 Context.conclude() 方法
+
         }
         catch (final Exception ex)
         {
+            // ==================== 异常处理 ====================
+            // 初始化失败时，标记 Mark File 为失败状态
             final ClusterMarkFile markFile = ctx.markFile;
             if (null != markFile)
             {
+                // 写入失败标记，供监控工具检测（如 aeron-stat）
+                // 这样管理员可以通过 Mark File 知道 Service 启动失败的原因
                 markFile.signalFailedStart();
             }
 
+            // 清理已分配的资源（关闭 Aeron 连接等）
             ctx.close();
+
+            // 重新抛出异常，让调用者知道启动失败
             throw ex;
         }
 
+        // ==================== 步骤 2: 创建 ClusteredServiceAgent ====================
+        // ClusteredServiceAgent 是 Service 的核心代理，负责：
+        // - 接收 ConsensusModule 的命令（通过 serviceControlSubscription）
+        // - 消费日志（调用 ClusteredService.onSessionMessage()）
+        // - 保存/恢复快照（调用 ClusteredService.onTakeSnapshot()/onStart()）
+        // - 管理 Service 生命周期
         final ClusteredServiceAgent agent = new ClusteredServiceAgent(ctx);
+
+        // ==================== 步骤 3: 创建 AgentRunner ====================
+        // Runner 模式：独立线程运行（ClusteredServiceContainer 始终使用 Runner 模式）
+        // - idleStrategy: 空闲策略（如 BackoffIdleStrategy，无工作时降低 CPU 占用）
+        // - errorHandler: 错误处理器（记录到 Mark File 错误缓冲区）
+        // - errorCounter: 错误计数器（用于监控）
+        // - agent: ClusteredServiceAgent 实例
         serviceAgentRunner = new AgentRunner(ctx.idleStrategy(), ctx.errorHandler(), ctx.errorCounter(), agent);
     }
 
@@ -142,16 +184,64 @@ public final class ClusteredServiceContainer implements AutoCloseable
     }
 
     /**
-     * Launch a ClusteredServiceContainer by providing a configuration context.
+     * 通过提供配置上下文启动 {@link ClusteredServiceContainer}。
+     * <p>
+     * 这是 Aeron Cluster 业务服务容器的主要入口点，负责：
+     * <ul>
+     *   <li>初始化配置（调用 {@link Context#conclude()}）</li>
+     *   <li>创建 {@link ClusteredServiceAgent}（Service 业务逻辑执行者）</li>
+     *   <li>启动 Agent（在独立线程上运行）</li>
+     * </ul>
+     * <p>
+     * <b>启动流程</b>：
+     * <pre>
+     * 1. 调用构造函数 new ClusteredServiceContainer(ctx)
+     *    ├─ ctx.conclude()：完成配置初始化
+     *    │   ├─ 创建工作目录（cluster-dir、mark-file-dir）
+     *    │   ├─ 连接到 Aeron MediaDriver
+     *    │   ├─ 分配计数器（用于监控）
+     *    │   └─ 创建 Archive 客户端
+     *    └─ new ClusteredServiceAgent(ctx)：创建 Service 代理
      *
-     * @param ctx for the configuration parameters.
-     * @return a new instance of a ClusteredServiceContainer.
+     * 2. 启动 Agent（Runner 模式）
+     *    └─ AgentRunner.startOnThread() - 在独立线程上运行
+     * </pre>
+     * <p>
+     * <b>与 ConsensusModule 的关系</b>：
+     * <ul>
+     *   <li><b>ConsensusModule</b>：负责 Raft 共识、日志复制、会话管理</li>
+     *   <li><b>ClusteredServiceContainer</b>：负责运行业务逻辑（ClusteredService）</li>
+     *   <li><b>通信方式</b>：ConsensusModule 通过 serviceControlPublication 向 Service 发送命令</li>
+     * </ul>
+     *
+     * @param ctx 配置参数上下文（必须包含 clusteredService、clusterId、serviceId 等）
+     * @return 新创建并已启动的 {@link ClusteredServiceContainer} 实例
+     * @throws ClusterException 如果配置无效或启动失败
      */
     public static ClusteredServiceContainer launch(final Context ctx)
     {
+        // ==================== 步骤 1: 创建 ClusteredServiceContainer 实例 ====================
+        // 内部调用 new ClusteredServiceContainer(ctx)，完成以下工作：
+        // 1. ctx.conclude()：初始化所有配置
+        // 2. new ClusteredServiceAgent(ctx)：创建 Service 代理
+        // 3. 创建 AgentRunner（准备在独立线程上运行）
         final ClusteredServiceContainer clusteredServiceContainer = new ClusteredServiceContainer(ctx);
+
+        // ==================== 步骤 2: 启动 Agent ====================
+        // 在新线程上启动 ClusteredServiceAgent
+        // - threadFactory: 用于创建新线程（可自定义线程名、优先级等）
+        // - serviceAgentRunner: 包装了 Agent 的执行器，持续调用 doWork()
+        // 线程启动后会执行：
+        // while (running) {
+        //     agent.doWork();  // ← ClusteredServiceAgent.doWork()
+        //     idleStrategy.idle(); // ← 无工作时的空闲策略
+        // }
         AgentRunner.startOnThread(clusteredServiceContainer.serviceAgentRunner, ctx.threadFactory());
 
+        // ==================== 步骤 3: 返回实例 ====================
+        // 此时 ClusteredServiceContainer 已经启动：
+        // - Agent 开始执行 onStart()（连接到 ConsensusModule、加载快照）
+        // - 随后进入主循环 doWork()（接收命令、执行业务逻辑）
         return clusteredServiceContainer;
     }
 
@@ -817,58 +907,109 @@ public final class ClusteredServiceContainer implements AutoCloseable
         }
 
         /**
-         * Conclude configuration by setting up defaults when specifics are not provided.
+         * 完成配置初始化：在用户未提供时设置默认值，创建必要的资源。
+         * <p>
+         * 这是 ClusteredServiceContainer 启动前的关键步骤，负责：
+         * <ul>
+         *   <li>校验配置参数（如 serviceId、clusterId）</li>
+         *   <li>创建工作目录（cluster-dir、mark-file-dir）</li>
+         *   <li>连接到 Aeron MediaDriver</li>
+         *   <li>分配计数器（用于监控和状态追踪）</li>
+         *   <li>创建 Archive 客户端（用于日志回放和快照加载）</li>
+         * </ul>
+         * <p>
+         * <b>执行顺序</b>：
+         * <pre>
+         * 1. 并发检查（确保只执行一次）
+         * 2. 参数校验（serviceId、clusterId）
+         * 3. 目录创建（clusterDir、markFileDir）
+         * 4. 时钟初始化（epochClock、nanoClock）
+         * 5. Mark File 创建（进程协调、错误缓冲区）
+         * 6. 错误处理初始化（errorLog、errorHandler）
+         * 7. 连接 Aeron（创建 Aeron 客户端）
+         * 8. 分配所有计数器（errorCounter、dutyCycleTracker 等）
+         * 9. 创建 AeronArchive.Context（Archive 控制通道）
+         * </pre>
+         * <p>
+         * <b>重要约束</b>：
+         * <ul>
+         *   <li>此方法只能被调用一次（通过 VarHandle 原子操作保证）</li>
+         *   <li>必须在 ClusteredServiceContainer 构造函数中调用</li>
+         *   <li>如果配置无效或资源创建失败，会抛出异常</li>
+         * </ul>
+         *
+         * @throws ConcurrentConcludeException 如果 conclude() 被并发调用
+         * @throws ClusterException 如果配置无效或资源创建失败
+         * @throws UncheckedIOException 如果目录操作失败
          */
         @SuppressWarnings("MethodLength")
         public void conclude()
         {
+            // ==================== 步骤 1: 并发检查 ====================
+            // 使用 VarHandle 原子操作确保 conclude() 只执行一次
+            // IS_CONCLUDED_VH: VarHandle 指向 isConcluded 字段
             if ((boolean)IS_CONCLUDED_VH.getAndSet(this, true))
             {
+                // 如果已经执行过（旧值为 true），抛出并发异常
                 throw new ConcurrentConcludeException();
             }
 
+            // ==================== 步骤 2: 参数校验 ====================
+
+            // 2.1 校验 Service ID（必须在 [0, MAX_SERVICE_COUNT-1] 范围内）
             final int maxId = MAX_SERVICE_COUNT - 1;
             if (serviceId < 0 || serviceId > maxId)
             {
                 throw new ConfigurationException("service id outside allowed range [0," + maxId + "]: " + serviceId);
             }
 
+            // ==================== 步骤 3: 初始化工厂和策略 ====================
+
+            // 3.1 线程工厂（用于创建 Agent 线程）
             if (null == threadFactory)
             {
                 threadFactory = Thread::new;
             }
 
+            // 3.2 空闲策略（无工作时降低 CPU 占用）
             if (null == idleStrategySupplier)
             {
                 idleStrategySupplier = Configuration.idleStrategySupplier(null);
             }
 
+            // 3.3 应用版本校验器（用于检查集群节点版本兼容性）
             if (null == appVersionValidator)
             {
                 appVersionValidator = AppVersionValidator.SEMANTIC_VERSIONING_VALIDATOR;
             }
 
+            // 3.4 时钟初始化
             if (null == epochClock)
             {
-                epochClock = SystemEpochClock.INSTANCE;
+                epochClock = SystemEpochClock.INSTANCE;  // ← 用于超时计算、Mark File 活跃性检测
             }
 
             if (null == nanoClock)
             {
-                nanoClock = SystemNanoClock.INSTANCE;
+                nanoClock = SystemNanoClock.INSTANCE;  // ← 用于高精度时间戳
             }
 
+            // ==================== 步骤 4: 目录初始化 ====================
+
+            // 4.1 创建集群工作目录
             if (null == clusterDir)
             {
                 clusterDir = new File(clusterDirectoryName);
             }
 
+            // 4.2 创建 Mark File 目录
             if (null == markFileDir)
             {
                 final String dir = Configuration.markFileDir();
                 markFileDir = Strings.isEmpty(dir) ? clusterDir : new File(dir);
             }
 
+            // 4.3 获取目录的标准路径（绝对路径）
             try
             {
                 clusterDir = clusterDir.getCanonicalFile();
@@ -880,34 +1021,53 @@ public final class ClusteredServiceContainer implements AutoCloseable
                 throw new UncheckedIOException(e);
             }
 
+            // 4.4 确保目录存在
             IoUtil.ensureDirectoryExists(clusterDir, "cluster");
             IoUtil.ensureDirectoryExists(markFileDir, "mark file");
 
+            // ==================== 步骤 5: 创建 Mark File ====================
+            // Mark File 用于：
+            // - 进程间协调（防止多进程启动同一 Service）
+            // - 错误日志缓冲区（保存最近的错误信息）
+            // - 活跃性检测（由外部监控工具读取）
             if (null == markFile)
             {
+                // 获取文件页大小（用于内存映射文件）
                 final int filePageSize = null != aeron ? aeron.context().filePageSize() :
                     driverFilePageSize(new File(aeronDirectoryName), epochClock, new CommonContext().driverTimeoutMs());
+
+                // 创建 Mark File（每个 Service 有独立的 Mark File）
+                // 文件名：cluster-mark-service-{serviceId}.dat
                 markFile = new ClusterMarkFile(
-                    new File(markFileDir, ClusterMarkFile.markFilenameForService(serviceId)),
-                    ClusterComponentType.CONTAINER,
-                    errorBufferLength,
-                    epochClock,
-                    LIVENESS_TIMEOUT_MS,
-                    filePageSize);
+                    new File(markFileDir, ClusterMarkFile.markFilenameForService(serviceId)),  // ← 文件路径
+                    ClusterComponentType.CONTAINER,                                            // ← 组件类型
+                    errorBufferLength,                                                         // ← 错误缓冲区大小
+                    epochClock,                                                                 // ← 时钟
+                    LIVENESS_TIMEOUT_MS,                                                       // ← 活跃超时（10 秒）
+                    filePageSize);                                                              // ← 文件页大小
             }
 
+            // 创建 Mark File 链接（供外部工具读取）
             MarkFile.ensureMarkFileLink(
                 clusterDir,
                 new File(markFile.parentDirectory(), ClusterMarkFile.markFilenameForService(serviceId)),
                 ClusterMarkFile.linkFilenameForService(serviceId));
 
+            // ==================== 步骤 6: 初始化错误处理 ====================
+
+            // 6.1 创建错误日志（写入 Mark File 的错误缓冲区）
             if (null == errorLog)
             {
-                errorLog = new DistinctErrorLog(markFile.errorBuffer(), epochClock, US_ASCII);
+                errorLog = new DistinctErrorLog(
+                    markFile.errorBuffer(),  // ← 错误缓冲区（内存映射）
+                    epochClock,              // ← 时钟（用于错误时间戳）
+                    US_ASCII);               // ← 字符编码
             }
 
+            // 6.2 设置错误处理器（如果用户未提供，使用默认的打印到 errorLog）
             errorHandler = CommonContext.setupErrorHandler(this.errorHandler, errorLog);
 
+            // 6.3 创建委托错误处理器（支持链式错误处理）
             if (null == delegatingErrorHandler)
             {
                 delegatingErrorHandler = Configuration.newDelegatingErrorHandler();
@@ -923,36 +1083,48 @@ public final class ClusteredServiceContainer implements AutoCloseable
                 errorHandler = delegatingErrorHandler;
             }
 
+            // ==================== 步骤 7: 设置 Service 名称 ====================
             if (Strings.isEmpty(serviceName))
             {
+                // Service 名称格式：clustered-service-{clusterId}-{serviceId}
+                // 示例：clustered-service-0-0
                 serviceName = "clustered-service-" + clusterId + "-" + serviceId;
             }
 
+            // ==================== 步骤 8: 连接到 Aeron ====================
             if (null == aeron)
             {
+                ownsAeronClient = true;  // ← 标记为自己创建的 Aeron 实例
+
+                // 创建 Aeron 客户端
                 aeron = Aeron.connect(
                     new Aeron.Context()
-                        .aeronDirectoryName(aeronDirectoryName)
-                        .errorHandler(errorHandler)
-                        .subscriberErrorHandler(RethrowingErrorHandler.INSTANCE)
-                        .awaitingIdleStrategy(YieldingIdleStrategy.INSTANCE)
-                        .epochClock(epochClock)
-                        .clientName(serviceName));
+                        .aeronDirectoryName(aeronDirectoryName)              // ← CnC 目录
+                        .errorHandler(errorHandler)                          // ← 错误处理器
+                        .subscriberErrorHandler(RethrowingErrorHandler.INSTANCE)  // ← 订阅错误处理
+                        .awaitingIdleStrategy(YieldingIdleStrategy.INSTANCE) // ← 等待策略
+                        .epochClock(epochClock)                              // ← 时钟
+                        .clientName(serviceName));                           // ← 客户端名称
 
                 ownsAeronClient = true;
             }
 
+            // 校验 Aeron 配置
             if (!(aeron.context().subscriberErrorHandler() instanceof RethrowingErrorHandler))
             {
                 throw new ClusterException("Aeron client must use a RethrowingErrorHandler");
             }
 
+            // ==================== 步骤 9: 分配计数器 ====================
             final ExpandableArrayBuffer tempBuffer = new ExpandableArrayBuffer();
+
+            // 9.1 错误计数器
             if (null == errorCounter)
             {
                 errorCounter = ClusterCounters.allocateServiceErrorCounter(aeron, tempBuffer, clusterId, serviceId);
             }
 
+            // 9.2 计数错误处理器（将错误计数写入计数器）
             if (null == countedErrorHandler)
             {
                 countedErrorHandler = new CountedErrorHandler(errorHandler, errorCounter);
@@ -962,6 +1134,7 @@ public final class ClusteredServiceContainer implements AutoCloseable
                 }
             }
 
+            // 9.3 Duty Cycle Tracker（用于监控 Agent 循环耗时）
             if (null == dutyCycleTracker)
             {
                 dutyCycleTracker = new DutyCycleStallTracker(
@@ -983,6 +1156,7 @@ public final class ClusteredServiceContainer implements AutoCloseable
                     cycleThresholdNs);
             }
 
+            // 9.4 Snapshot Duration Tracker（用于监控快照耗时）
             if (null == snapshotDurationTracker)
             {
                 snapshotDurationTracker = new SnapshotDurationTracker(
@@ -1006,16 +1180,19 @@ public final class ClusteredServiceContainer implements AutoCloseable
                     snapshotDurationThresholdNs);
             }
 
+            // ==================== 步骤 10: 创建 AeronArchive.Context ====================
+            // AeronArchive 用于日志回放和快照加载
             if (null == archiveContext)
             {
                 archiveContext = new AeronArchive.Context()
-                    .controlRequestChannel(AeronArchive.Configuration.localControlChannel())
-                    .controlResponseChannel(AeronArchive.Configuration.localControlChannel())
-                    .controlRequestStreamId(AeronArchive.Configuration.localControlStreamId())
+                    .controlRequestChannel(AeronArchive.Configuration.localControlChannel())          // ← Archive 控制通道
+                    .controlResponseChannel(AeronArchive.Configuration.localControlChannel())         // ← Archive 响应通道
+                    .controlRequestStreamId(AeronArchive.Configuration.localControlStreamId())        // ← 控制流 ID
                     .controlResponseStreamId(
                         clusterId * 100 + 100 + AeronArchive.Configuration.controlResponseStreamId() + (serviceId + 1));
             }
 
+            // 校验 Archive 控制通道必须是 IPC
             if (!archiveContext.controlRequestChannel().startsWith(CommonContext.IPC_CHANNEL))
             {
                 throw new ClusterException("local archive control must be IPC");
@@ -1026,6 +1203,7 @@ public final class ClusteredServiceContainer implements AutoCloseable
                 throw new ClusterException("local archive control must be IPC");
             }
 
+            // 配置 Archive Context
             archiveContext
                 .aeron(aeron)
                 .ownsAeronClient(false)
@@ -1039,17 +1217,23 @@ public final class ClusteredServiceContainer implements AutoCloseable
                 "sc-" + serviceId + "-archive-ctrl-resp-cluster-" + clusterId))
                 .clientName(serviceName);
 
+            // ==================== 步骤 11: 设置终止钩子 ====================
             if (null == terminationHook)
             {
                 terminationHook = () -> {};
             }
 
+            // ==================== 步骤 12: 校验 ClusteredService ====================
+            // 必须提供 ClusteredService 实例（这是业务逻辑的核心）
             if (null == clusteredService)
             {
                 clusteredService = Configuration.newClusteredService();
             }
 
+            // ==================== 步骤 13: 初始化终止同步器 ====================
             abortLatch = new CountDownLatch(!aeron.context().useConductorAgentInvoker() ? 1 : 0);
+
+            // ==================== 步骤 14: 完成 Mark File 配置 ====================
             concludeMarkFile();
 
             if (CommonContext.shouldPrintConfigurationOnStart())

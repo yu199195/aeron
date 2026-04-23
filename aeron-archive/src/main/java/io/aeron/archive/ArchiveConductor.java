@@ -171,11 +171,21 @@ abstract class ArchiveConductor
     {
         super("archive-conductor", ctx.countedErrorHandler());
 
+        // ArchiveConductor 是 Archive 的“控制面”主循环（Agent）：
+        // - 负责处理控制协议（start/stop recording、replay、replicate、truncate、list 等）
+        // - 管理 RecordingSession/ReplaySession 等会话生命周期
+        // - 驱动 Recorder/Replayer 等工作组件（在 onStart() 里创建）
+        //
+        // 该构造方法的核心职责是：把 Context 已经 conclude() 过的配置与依赖一次性 wiring 完成，
+        // 并建立与 Aeron 的必要回调/订阅，使得 onStart()/doWork() 可以直接进入工作状态。
         this.ctx = ctx;
 
+        // --- 1) 获取 Aeron 相关依赖与 invoker（用于在特定 threading mode 下“外部驱动”Aeron/Driver） ---
         aeron = ctx.aeron();
         aeronAgentInvoker = aeron.conductorAgentInvoker();
         driverAgentInvoker = ctx.mediaDriverAgentInvoker();
+
+        // --- 2) 时间源与关键路径参数（doWork 内频繁使用，提前缓存为字段以避免重复查找/转换） ---
         epochClock = ctx.epochClock();
         nanoClock = ctx.nanoClock();
         archiveDir = ctx.archiveDir();
@@ -186,8 +196,10 @@ abstract class ArchiveConductor
         dutyCycleTracker = ctx.conductorDutyCycleTracker();
         cachedEpochClock.update(epochClock.time());
 
+        // --- 3) 随机源（用于 token/nonce 等安全相关或不可预测 id 的生成） ---
         random = ctx.secureRandom();
 
+        // --- 4) 安全：鉴权/授权服务必须非空；在这里 fail-fast 避免运行期出现“半初始化”状态 ---
         authenticator = ctx.authenticatorSupplier().get();
         if (null == authenticator)
         {
@@ -200,12 +212,19 @@ abstract class ArchiveConductor
             throw new ArchiveException("authorisation service cannot be null");
         }
 
+        // --- 5) 注册 Aeron 回调：用于清理资源与处理“底层对象不可用”的异步事件 ---
+        // unavailableCounter：当 counter 失效时清理本地映射，避免资源泄漏
+        // closeHandler：当 Aeron 被关闭（或驱动异常）触发 abort，快速终止 Archive
         unavailableCounterHandlerRegistrationId = aeron.addUnavailableCounterHandler(this);
         closeHandlerRegistrationId = aeron.addCloseHandler(this::abort);
 
+        // --- 6) 录制事件流（可选）：提供给外部订阅者观察 recording 的状态变化 ---
         recordingEventsProxy = ctx.recordingEventsEnabled() ? new RecordingEventsProxy(
             aeron.addExclusivePublication(ctx.recordingEventsChannel(), ctx.recordingEventsStreamId())) : null;
 
+        // --- 7) 控制面订阅（可选的 remote control + 必选的 local control） ---
+        // controlSubscription：面向远端控制（可关闭）；根据配置控制 term buffer 是否 sparse
+        // localControlSubscription：本地控制通道（通常用于同进程或同主机控制）
         if (ctx.controlChannelEnabled())
         {
             final ChannelUri controlChannelUri = ChannelUri.parse(ctx.controlChannel());
@@ -221,6 +240,7 @@ abstract class ArchiveConductor
         localControlSubscription = aeron.addSubscription(
             ctx.localControlChannel(), ctx.localControlStreamId(), null, this);
 
+        // --- 8) 控制协议适配器：负责从 subscription 轮询并解码请求，转发到本 conductor，并执行授权检查 ---
         controlSessionAdapter = new ControlSessionAdapter(
             decoders, controlSubscription, localControlSubscription, this, authorisationService);
     }
@@ -498,6 +518,18 @@ abstract class ArchiveConductor
         controlSession.sendOkResponse(correlationId, ctx.archiveId());
     }
 
+    /**
+     * 处理 {@code StartRecordingRequest}：由 {@link ControlSessionAdapter#poll()} 解码控制消息后，
+     * {@link ControlSession#onStartRecording} 转发到此。
+     * <p>
+     * 对 {@link SourceLocation#LOCAL} 且为 UDP 的通道：在去掉 session 等参数后的 URI 前加
+     * {@link io.aeron.CommonContext#SPY_PREFIX}{@code aeron-spy:}，再调用
+     * {@link Aeron#addSubscription(String, int, AvailableImageHandler, UnavailableImageHandler)}
+     * —— 即 spy 订阅本 MediaDriver 内目标 {@code Publication} 的日志，与客户端数据面
+     * {@code Publication#offer} 共享同一条流的 buffer（不经网络复制）。非 LOCAL 或非标 UDP 则订阅剥离后的裸 channel。
+     * <p>
+     * {@code originalChannel} 来自控制协议，须与发送端 {@code addPublication(channel, streamId)} 一致。
+     */
     void startRecording(
         final long correlationId,
         final int streamId,
@@ -520,16 +552,20 @@ abstract class ArchiveConductor
 
         try
         {
+            // 与客户端 startRecording(channel,…) 传入字符串一致；用于去重键及 catalog 中的 channel 元数据
             final ChannelUri channelUri = ChannelUri.parse(originalChannel);
             final String key = makeKey(streamId, channelUri);
             final Subscription oldSubscription = recordingSubscriptionByKeyMap.get(key);
 
             if (null == oldSubscription)
             {
+                // 去掉 control/session 等参数，得到实际订阅用的 URI 字符串（catalog 等用 stripped）
                 final String strippedChannel = strippedChannelBuilder(channelUri).build();
+                // LOCAL + UDP：spy 读本地 term buffer；否则为远端/非 spy 订阅（如 REMOTE 录制网络流）
                 final String channel = sourceLocation == SourceLocation.LOCAL && channelUri.isUdp() ?
                     SPY_PREFIX + strippedChannel : strippedChannel;
 
+                // Image 就绪后异步建 RecordingSession（catalog、RecordingPos、落盘）；避免在 conductor 回调里阻塞
                 final AvailableImageHandler handler = (image) -> taskQueue.addLast(() -> startRecordingSession(
                     controlSession, correlationId, strippedChannel, originalChannel, image, autoStop));
 

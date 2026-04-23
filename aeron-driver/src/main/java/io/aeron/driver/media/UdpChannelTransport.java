@@ -39,7 +39,11 @@ import static java.net.StandardSocketOptions.SO_RCVBUF;
 import static java.net.StandardSocketOptions.SO_SNDBUF;
 
 /**
- * Base class for UDP channel transports which is specialised for send or receive endpoints.
+ * 发送端 / 接收端 UDP 传输的基类：持有 {@link DatagramChannel}、bind/connect 地址与 socket 参数。
+ * <p>
+ * {@link SendChannelEndpoint} 在 {@link #openDatagramChannel} 中创建并绑定发送用 {@code DatagramChannel}；
+ * 数据帧经子类 {@link SendChannelEndpoint#send(ByteBuffer)} 调用 {@code DatagramChannel.write/send} 进入内核 UDP。
+ * 接收侧 {@link io.aeron.driver.media.ReceiveChannelEndpoint} 则对另一 {@code DatagramChannel} 做 {@code receive} / selector 读。
  */
 public abstract class UdpChannelTransport implements AutoCloseable
 {
@@ -176,28 +180,51 @@ public abstract class UdpChannelTransport implements AutoCloseable
     }
 
     /**
-     * Open the underlying channel for reading and writing.
+     * 【UDP Socket 打开的核心方法】
+     * 创建 DatagramChannel 并 bind 到指定地址/端口，配置非阻塞模式。
+     * <p>
+     * 对于发送端（SendChannelEndpoint.openChannel() 调用此方法）：
+     * <pre>
+     *   单播模式：bind 到本地地址（端口可能由 PortManager 自动分配临时端口）
+     *            → 后续 Sender 线程通过此 channel 发送数据帧到远端 endpoint
+     *   多播模式：bind 到多播端口 + join 多播组
+     *            → 通过 IP_MULTICAST_IF 指定出站网卡
+     * </pre>
+     * 创建完成后，此 DatagramChannel 会被注册到 Sender 线程的 NIO Selector 上：
+     * <pre>
+     *   senderProxy.registerSendChannelEndpoint(endpoint)
+     *     → controlTransportPoller.registerForRead(endpoint)
+     *       → receiveDatagramChannel.register(selector, OP_READ)
+     * </pre>
+     * 这样 Sender 线程就能通过 Selector.select() 监听来自接收端的控制消息（NAK/StatusMessage）。
      *
-     * @param statusIndicator to set for {@link ChannelEndpointStatus} which could be
-     *                        {@link ChannelEndpointStatus#ERRORED}.
+     * @param statusIndicator 通道状态计数器，出错时设为 ERRORED
      */
     public void openDatagramChannel(final AtomicCounter statusIndicator)
     {
         try
         {
+            // ★ 创建 UDP DatagramChannel（IPv4 或 IPv6 取决于 channel URI 中的地址）
             sendDatagramChannel = DatagramChannel.open(udpChannel.protocolFamily());
+            // 默认收发共用同一个 channel（单播场景）
             receiveDatagramChannel = sendDatagramChannel;
 
             if (udpChannel.isMulticast())
             {
+                // === 多播模式 ===
                 if (null != connectAddress)
                 {
+                    // 有 connect 地址时，收发用不同的 channel
                     receiveDatagramChannel = DatagramChannel.open(udpChannel.protocolFamily());
                 }
 
+                // 允许多个进程/线程 bind 同一多播端口
                 receiveDatagramChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true);
+                // bind 到多播端口
                 receiveDatagramChannel.bind(new InetSocketAddress(endPointAddress.getPort()));
+                // 加入多播组，指定网卡接口
                 receiveDatagramChannel.join(endPointAddress.getAddress(), udpChannel.localInterface());
+                // 设置多播出站网卡
                 sendDatagramChannel.setOption(StandardSocketOptions.IP_MULTICAST_IF, udpChannel.localInterface());
 
                 if (udpChannel.hasMulticastTtl())
@@ -213,15 +240,21 @@ public abstract class UdpChannelTransport implements AutoCloseable
             }
             else
             {
+                // === 单播模式 ===
+                // PortManager 负责端口管理：如果 bindAddress 端口为 0，OS 会自动分配一个临时端口
                 bindAddress = portManager.getManagedPort(udpChannel, bindAddress);
+                // ★ bind：将 DatagramChannel 绑定到本地地址和端口，此时 UDP Socket 正式开启
                 sendDatagramChannel.bind(bindAddress);
             }
 
             if (null != connectAddress)
             {
+                // connect（仅对单播有意义）：将 socket 连接到远端地址，
+                // 后续 send() 不需要再指定目标地址，且只接收来自该地址的数据
                 sendDatagramChannel.connect(connectAddress);
             }
 
+            // 设置 socket 缓冲区大小
             if (0 != socketSndbufLength())
             {
                 sendDatagramChannel.setOption(SO_SNDBUF, socketSndbufLength());
@@ -232,6 +265,7 @@ public abstract class UdpChannelTransport implements AutoCloseable
                 receiveDatagramChannel.setOption(SO_RCVBUF, socketRcvbufLength());
             }
 
+            // ★ 配置为非阻塞模式：Sender 线程通过 NIO Selector 进行事件驱动的 I/O
             sendDatagramChannel.configureBlocking(false);
             receiveDatagramChannel.configureBlocking(false);
         }

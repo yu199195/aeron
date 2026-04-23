@@ -77,7 +77,9 @@ final class ClientCommandAdapter implements ControlledMessageHandler
     }
 
     /**
-     * {@inheritDoc}
+     * 从 to-driver RingBuffer 读取到消息后的分发入口。
+     * Driver Conductor 线程周期性调用 controlledRead()，每读到一条消息就回调此方法。
+     * 根据 msgTypeId 将消息路由到 DriverConductor 对应的处理方法。
      */
     @SuppressWarnings("MethodLength")
     public ControlledMessageHandler.Action onMessage(
@@ -85,6 +87,7 @@ final class ClientCommandAdapter implements ControlledMessageHandler
     {
         long correlationId = 0;
 
+        // Driver 正在关闭时拒绝处理新命令
         if (conductor.notAcceptingClientCommands())
         {
             return Action.ABORT;
@@ -94,12 +97,15 @@ final class ClientCommandAdapter implements ControlledMessageHandler
         {
             switch (msgTypeId)
             {
+                // Client 调用 aeron.addPublication() 时写入的命令
                 case ADD_PUBLICATION:
                 {
+                    // 用 Flyweight 解码消息字段（零拷贝，直接操作 RingBuffer 底层 buffer）
                     publicationMsgFlyweight.wrap(buffer, index);
                     publicationMsgFlyweight.validateLength(msgTypeId, length);
 
                     correlationId = publicationMsgFlyweight.correlationId();
+                    // isExclusive = false：ConcurrentPublication，支持多线程共享
                     addPublication(correlationId, false);
                     break;
                 }
@@ -351,6 +357,11 @@ final class ClientCommandAdapter implements ControlledMessageHandler
         return Action.CONTINUE;
     }
 
+    /**
+     * 根据 channel 前缀判断走 IPC 还是网络路径，路由到 DriverConductor 对应处理方法：
+     * - "aeron:ipc" 开头 → onAddIpcPublication()（进程间通信，共享 LogBuffer 零拷贝）
+     * - 其他（如 "aeron:udp?..."） → onAddNetworkPublication()（网络传输，走 UDP Socket）
+     */
     private void addPublication(final long correlationId, final boolean isExclusive)
     {
         final long clientId = publicationMsgFlyweight.clientId();

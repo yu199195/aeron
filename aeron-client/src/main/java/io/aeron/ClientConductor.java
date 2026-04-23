@@ -342,18 +342,24 @@ final class ClientConductor implements Agent
         final int statusIndicatorId,
         final String logFileName)
     {
+        // 取出 addPublication() 时暂存的 channel 字符串
         final String stashedChannel = stashedChannelByRegistrationId.remove(correlationId);
         final ConcurrentPublication publication = new ConcurrentPublication(
             this,
             stashedChannel,
             streamId,
             sessionId,
+            // publisherLimit：包装 CnC countersValuesBuffer 中的计数器位置，
+            // Client 在 offer() 时读取此值判断是否可继续写入（流控）
             new UnsafeBufferPosition(counterValuesBuffer, publicationLimitId),
             statusIndicatorId,
+            // mmap 映射 Driver 创建的 LogBuffer 文件（3 个 term buffer + 1 个 metadata buffer），
+            // 后续 offer() 直接写入此 mmap 内存区域，实现零拷贝
             logBuffers(registrationId, logFileName, stashedChannel),
             registrationId,
             correlationId);
 
+        // 存入 map，addPublication() 中的 awaitResponse() 返回后从此处取出
         resourceByRegIdMap.put(correlationId, publication);
     }
 
@@ -405,8 +411,25 @@ final class ClientConductor implements Agent
     }
 
     /**
-     * Driver 通知：某 Publisher 的流对本订阅可用。为 Subscription 创建 Image（绑定 logBuffers、subscriberPosition），
-     * 加入 subscription.images，并回调 availableImageHandler；接收端 poll 时从这些 Image 读数据。
+     * 当 Driver 通过 toClientBuffer 发送 ON_AVAILABLE_IMAGE 事件时触发此回调。
+     * 这意味着某个 Publisher 的数据流已与本 Subscription 匹配，可以开始接收数据了。
+     * <p>
+     * 核心流程：
+     * <pre>
+     * 1. 通过 subscriptionRegistrationId 从 resourceByRegIdMap 找到对应的 Subscription
+     * 2. 用 logFileName 打开 Publisher 的 LogBuffer 文件并 mmap 映射到本进程
+     *    （logBuffers() 内部调用 MappedLogBuffersFactory.map()）
+     * 3. 创建 Image 对象，关键组成：
+     *    - LogBuffer：mmap 映射的数据缓冲区（与 Publisher 共享同一物理内存）
+     *    - subscriberPosition：CnC 共享内存中的计数器，记录本订阅者读取到的位置
+     *      Publisher 通过读取此计数器实现流控（back-pressure）
+     *    - sessionId：标识数据流来自哪个 Publisher 会话
+     * 4. 将 Image 加入 subscription.images 数组（volatile 写，对 poll 线程可见）
+     * 5. 回调 availableImageHandler 通知应用层
+     * </pre>
+     * <p>
+     * 之后应用调用 subscription.poll() 时，会轮询所有 Image，
+     * 从它们各自的 LogBuffer mmap 内存中直接读取数据帧（零拷贝）。
      */
     void onAvailableImage(
         final long correlationId,
@@ -419,15 +442,21 @@ final class ClientConductor implements Agent
         final Subscription subscription = (Subscription)resourceByRegIdMap.get(subscriptionRegistrationId);
         if (null != subscription)
         {
+            // 创建 Image：打开 Publisher 的 LogBuffer 文件并 mmap 映射
+            // LogBuffer 文件由 Driver 在处理 ADD_PUBLICATION 时创建，
+            // Publisher 和 Subscriber 通过 mmap 同一文件实现零拷贝数据传输
             final Image image = new Image(
                 subscription,
                 sessionId,
+                // subscriberPosition：指向 CnC countersValuesBuffer 中的一个 long 计数器
+                // Image.poll() 每读取一批数据后更新此位置，Driver 据此实现流控
                 new UnsafeBufferPosition(counterValuesBuffer, subscriberPositionId),
                 logBuffers(correlationId, logFileName, subscription.channel()),
                 ctx.subscriberErrorHandler(),
                 sourceIdentity,
                 correlationId);
 
+            // volatile 写入 subscription.images 数组，对 poll 调用线程立即可见
             subscription.addImage(image);
 
             final AvailableImageHandler handler = subscription.availableImageHandler();
@@ -541,16 +570,23 @@ final class ClientConductor implements Agent
      */
     ConcurrentPublication addPublication(final String channel, final int streamId)
     {
+        // 加锁：所有 Client API 操作需要串行化，防止并发写入 RingBuffer 时出现竞态
         clientLock.lock();
         try
         {
-            ensureActive();
-            ensureNotReentrant();
+            ensureActive();       // 确认 Client 未关闭
+            ensureNotReentrant(); // 防止在回调（如 availableImageHandler）中重入调用
 
+            // 通过 DriverProxy 将 ADD_PUBLICATION 命令写入 CnC to-driver RingBuffer，
+            // 返回的 registrationId 即 correlationId，用于后续匹配 Driver 的响应
             final long registrationId = driverProxy.addPublication(channel, streamId);
+            // 暂存 channel 字符串：onNewPublication() 回调时需要用它来构造 ConcurrentPublication
             stashedChannelByRegistrationId.put(registrationId, channel);
+            // 阻塞等待 Driver 通过 to-clients BroadcastBuffer 回写 PUBLICATION_READY 响应，
+            // 内部会循环 poll，收到后触发 onNewPublication() 构造 ConcurrentPublication 存入 resourceByRegIdMap
             awaitResponse(registrationId);
 
+            // 从 map 中取出 onNewPublication() 已经构造好的 ConcurrentPublication 返回给调用者
             return (ConcurrentPublication)resourceByRegIdMap.get(registrationId);
         }
         finally
@@ -741,8 +777,22 @@ final class ClientConductor implements Agent
     }
 
     /**
-     * 同步添加 Subscription：向 Driver 发送 ADD_SUBSCRIPTION，等待 SUBSCRIPTION_READY；
-     * 之后当有 Publisher 连接时 Driver 会发 AVAILABLE_IMAGE，在此处 onAvailableImage 里为 subscription 添加 Image。
+     * 同步添加 Subscription 的完整流程：
+     * <pre>
+     * 1. driverProxy.addSubscription() —— 将 ADD_SUBSCRIPTION 命令写入 CnC toDriverBuffer（共享内存 RingBuffer）
+     * 2. new Subscription() —— 在客户端创建 Subscription 对象（此时 images 为空，尚不能接收数据）
+     * 3. resourceByRegIdMap.put() —— 以 correlationId 为 key 注册，Driver 回复时通过此 id 关联
+     * 4. awaitResponse() —— 阻塞轮询 toClientBuffer（BroadcastReceiver），等待 Driver 回复 ON_SUBSCRIPTION_READY
+     *    └─ Driver 侧（DriverConductor）处理流程：
+     *       a. 从 toDriverBuffer 消费到 ADD_SUBSCRIPTION 命令
+     *       b. 创建/复用 ReceiveChannelEndpoint（UDP socket），注册到 Receiver 线程
+     *       c. 通过 ClientProxy 将 ON_SUBSCRIPTION_READY 写入 toClientsBuffer
+     *       d. 如果已有匹配的 Publisher，还会发送 ON_AVAILABLE_IMAGE
+     * 5. return subscription —— awaitResponse 返回后，Subscription 已就绪；
+     *    后续 Publisher 连接时 Driver 会异步发送 ON_AVAILABLE_IMAGE，
+     *    ClientConductor 在 onAvailableImage() 中为 subscription 添加 Image，
+     *    应用通过 subscription.poll() 从 Image 的 LogBuffer 中拉取数据。
+     * </pre>
      */
     Subscription addSubscription(
         final String channel,
@@ -750,13 +800,21 @@ final class ClientConductor implements Agent
         final AvailableImageHandler availableImageHandler,
         final UnavailableImageHandler unavailableImageHandler)
     {
+        // 获取客户端锁，保证同一时刻只有一个线程与 Driver 交互
         clientLock.lock();
         try
         {
             ensureActive();
             ensureNotReentrant();
 
+            // ① 通过 DriverProxy 将 ADD_SUBSCRIPTION 命令写入 CnC 共享内存的 toDriverBuffer（ManyToOneRingBuffer）
+            //    内部流程：tryClaim 在 ring buffer 中分配空间 → 用 Flyweight 序列化命令 → commit 提交
+            //    返回 correlationId，全局唯一，用于匹配 Driver 的异步响应
             final long correlationId = driverProxy.addSubscription(channel, streamId);
+
+            // ② 创建客户端侧的 Subscription 对象
+            //    此时 images[] 为空数组，subscription 还不能接收任何数据
+            //    当 Publisher 连接后 Driver 发送 ON_AVAILABLE_IMAGE 时，才会通过 onAvailableImage() 添加 Image
             final Subscription subscription = new Subscription(
                 this,
                 channel,
@@ -765,7 +823,14 @@ final class ClientConductor implements Agent
                 availableImageHandler,
                 unavailableImageHandler);
 
+            // ③ 以 correlationId 为 key 注册到资源表
+            //    当 Driver 回复 ON_SUBSCRIPTION_READY 时，通过 correlationId 找到这个 subscription
+            //    并在 onNewSubscription() 中设置 channelStatusId
             resourceByRegIdMap.put(correlationId, subscription);
+
+            // ④ 阻塞等待 Driver 回复 ON_SUBSCRIPTION_READY
+            //    内部不断轮询 toClientBuffer（CnC 共享内存的 BroadcastReceiver），
+            //    直到 receivedCorrelationId == correlationId 或超时
             awaitResponse(correlationId);
 
             return subscription;
@@ -1744,17 +1809,26 @@ final class ClientConductor implements Agent
         }
     }
 
+    /**
+     * 打开并 mmap 映射 Driver 创建的 LogBuffer 文件。
+     * 文件包含 3 个 Term Buffer + 1 个 Log Metadata Buffer。
+     * 后续 offer() 直接写入 mmap 内存区域，Driver/Sender 线程映射同一文件读取数据，实现零拷贝。
+     * 如果是复用已有 Publication（相同 registrationId），直接返回已缓存的 LogBuffers 并增加引用计数。
+     */
     private LogBuffers logBuffers(final long registrationId, final String logFileName, final String channel)
     {
+        // 先查缓存：复用已有 Publication 时 LogBuffers 可能已经映射过
         LogBuffers logBuffers = logBuffersByIdMap.get(registrationId);
         if (null == logBuffers)
         {
             try
             {
+                // 首次映射：调用 MappedLogBuffersFactory.map() 打开文件并做 mmap
                 logBuffers = logBuffersFactory.map(logFileName);
 
                 if (ctx.preTouchMappedMemory())
                 {
+                    // 预触摸所有内存页，避免后续首次写入时产生 page fault 导致延迟抖动
                     logBuffers.preTouch();
                 }
 
@@ -1767,6 +1841,7 @@ final class ClientConductor implements Agent
             }
         }
 
+        // 引用计数+1：多个 ConcurrentPublication 可共享同一个 LogBuffers
         logBuffers.incRef();
 
         return logBuffers;
@@ -1819,6 +1894,26 @@ final class ClientConductor implements Agent
         forceCloseResources();
     }
 
+    /**
+     * 阻塞等待 Driver 对指定 correlationId 命令的响应。
+     * <p>
+     * 核心机制：在 do-while 循环中反复调用 service() → driverEventsAdapter.receive()，
+     * 从 CnC 共享内存的 toClientBuffer（BroadcastReceiver）中读取 Driver 写入的响应消息。
+     * 当读到 correlationId 匹配的响应时返回；超过 driverTimeoutNs 则抛出超时异常。
+     * <p>
+     * 响应处理链路：
+     * <pre>
+     *   service(correlationId)
+     *     └─ driverEventsAdapter.receive(correlationId)
+     *          └─ receiver.receive(this)  // 从 toClientBuffer 读取消息
+     *               └─ onMessage(msgTypeId, buffer, index, length)  // 按消息类型分发
+     *                    ├─ ON_SUBSCRIPTION_READY → conductor.onNewSubscription()
+     *                    ├─ ON_PUBLICATION_READY  → conductor.onNewPublication()
+     *                    ├─ ON_AVAILABLE_IMAGE    → conductor.onAvailableImage()
+     *                    ├─ ON_ERROR              → 设置 driverException
+     *                    └─ ...
+     * </pre>
+     */
     private void awaitResponse(final long correlationId)
     {
         final long nowNs = nanoClock.nanoTime();
@@ -1828,6 +1923,7 @@ final class ClientConductor implements Agent
         awaitingIdleStrategy.reset();
         do
         {
+            // 嵌入式 Driver 模式下驱动 Driver Agent 执行一轮工作（处理命令、发送响应等）
             if (null == driverAgentInvoker)
             {
                 awaitingIdleStrategy.idle();
@@ -1837,11 +1933,15 @@ final class ClientConductor implements Agent
                 driverAgentInvoker.invoke();
             }
 
+            // 从 toClientBuffer（CnC 共享内存中 Driver→Client 方向的 BroadcastReceiver）
+            // 读取 Driver 写入的响应消息，并分发到对应的回调方法
             service(correlationId);
 
+            // 检查是否已收到目标 correlationId 的响应
             if (driverEventsAdapter.receivedCorrelationId() == correlationId)
             {
                 stashedChannelByRegistrationId.remove(correlationId);
+                // 如果 Driver 返回的是错误响应，则抛出异常
                 final RegistrationException ex = driverException;
                 if (null != ex)
                 {

@@ -38,7 +38,28 @@ import static java.nio.file.StandardOpenOption.*;
 import static org.agrona.BitUtil.align;
 
 /**
- * Encapsulates responsibility for mapping the files into memory used by the log partitions.
+ * 【LogBuffer 文件的实际创建和 mmap 映射】
+ * 在构造函数中完成以下工作：
+ * <pre>
+ *   1. FileChannel.open(CREATE_NEW) → 在磁盘上创建新文件
+ *   2. truncate(logLength)          → 设置文件大小（3 × termLength + metadata）
+ *   3. FileChannel.map(READ_WRITE)  → mmap 映射到进程虚拟内存
+ *   4. 将映射区域切分为 3 个 termBuffer + 1 个 logMetaDataBuffer
+ * </pre>
+ * 文件布局：
+ * <pre>
+ *   ┌─────────────────────┐  offset 0
+ *   │ Term Buffer 0       │  大小 = termLength（默认 16MB）
+ *   ├─────────────────────┤  offset termLength
+ *   │ Term Buffer 1       │  大小 = termLength
+ *   ├─────────────────────┤  offset 2 × termLength
+ *   │ Term Buffer 2       │  大小 = termLength
+ *   ├─────────────────────┤  offset 3 × termLength
+ *   │ Log Metadata Buffer │  大小 = LOG_META_DATA_LENGTH
+ *   └─────────────────────┘
+ * </pre>
+ * Client 端收到 PUBLICATION_READY 后，用同一个文件路径调用 logBuffersFactory.map()
+ * 做 mmap 映射，从而与 Driver 共享同一块物理内存，实现零拷贝通信。
  */
 class MappedRawLog implements RawLog
 {
@@ -70,28 +91,35 @@ class MappedRawLog implements RawLog
         this.logLength = logLength;
         this.mappedBytesCounter = mappedBytesCounter;
 
+        // 稀疏文件模式（SPARSE）：不预分配物理页面，首次写入时才触发分配，节省初始内存
         final EnumSet<StandardOpenOption> options = useSparseFiles ? SPARSE_FILE_OPTIONS : FILE_OPTIONS;
         try
         {
+            // ★ 关键：CREATE_NEW 标志确保创建全新文件；如果已存在则抛异常
             try (FileChannel logChannel = FileChannel.open(logFile.toPath(), options))
             {
-                logChannel.truncate(logLength); // set file size like the C driver does
+                // 设置文件大小（此时文件内容全为 0）
+                logChannel.truncate(logLength);
                 if (logLength <= Integer.MAX_VALUE)
                 {
+                    // 文件 ≤ 2GB：整个文件映射为一个 MappedByteBuffer
                     final MappedByteBuffer mappedBuffer = logChannel.map(READ_WRITE, 0, logLength);
                     mappedBuffer.order(ByteOrder.LITTLE_ENDIAN);
                     mappedBuffers = new MappedByteBuffer[]{ mappedBuffer };
 
+                    // 将映射区域切分为 3 个 Term Buffer（PARTITION_COUNT = 3）
                     for (int i = 0; i < PARTITION_COUNT; i++)
                     {
                         termBuffers[i] = new UnsafeBuffer(mappedBuffer, i * termLength, termLength);
                     }
 
+                    // 文件末尾是 Log Metadata Buffer（存放 activeTermCount、tailPosition 等元数据）
                     logMetaDataBuffer = new UnsafeBuffer(
                         mappedBuffer, (int)(logLength - LOG_META_DATA_LENGTH), LOG_META_DATA_LENGTH);
                 }
                 else
                 {
+                    // 文件 > 2GB：每个 term 单独映射（MappedByteBuffer 最大 Integer.MAX_VALUE）
                     mappedBuffers = new MappedByteBuffer[PARTITION_COUNT + 1];
 
                     for (int i = 0; i < PARTITION_COUNT; i++)
@@ -118,9 +146,12 @@ class MappedRawLog implements RawLog
 
                 if (!useSparseFiles)
                 {
+                    // 非稀疏文件模式：预触摸所有页面，迫使 OS 分配物理内存，
+                    // 避免后续首次写入时产生 page fault 导致延迟抖动
                     preTouchPages(termBuffers, termLength, filePageSize);
                 }
 
+                // 更新全局计数器：Driver 总共映射了多少字节的 LogBuffer
                 mappedBytesCounter.getAndAddRelease(logLength);
             }
         }

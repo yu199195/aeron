@@ -108,11 +108,18 @@ public final class Aeron implements AutoCloseable
     {
         try
         {
+            // ① conclude() 是连接的核心入口，内部调用链：
+            //    conclude() → connectToDriver() → awaitCncFileCreation()
+            //    完成后，ctx 中的 toDriverBuffer / toClientBuffer / counters 等共享内存通道全部就绪
             ctx.conclude();
 
             this.ctx = ctx;
             clientId = ctx.clientId();
+            // ② commandBuffer 就是 connectToDriver() 中创建的 ManyToOneRingBuffer，
+            //    指向 CnC 文件中 to-driver 区段的 mmap 内存
             commandBuffer = ctx.toDriverBuffer();
+            // ③ ClientConductor 负责：轮询 toClientBuffer 接收 Driver 响应、
+            //    维护 Publication/Subscription 生命周期、发送心跳保活
             conductor = new ClientConductor(ctx, this);
 
             if (ctx.useConductorAgentInvoker())
@@ -161,8 +168,14 @@ public final class Aeron implements AutoCloseable
     {
         try
         {
+            // 步骤 A：构造 Aeron 实例（内部调用 ctx.conclude() → connectToDriver()，完成 mmap 连接）
             final Aeron aeron = new Aeron(ctx);
 
+            // 步骤 B：启动 ClientConductor 线程（或 invoker），开始轮询 Driver 的响应。
+            // ClientConductor 在独立线程中持续执行：
+            //   - 从 toClientBuffer（BroadcastReceiver）读取 Driver 的响应消息
+            //   - 向 toDriverBuffer 发送心跳保活（keepalive）
+            //   - 处理 Publication/Subscription 的异步确认与错误
             if (ctx.useConductorAgentInvoker())
             {
                 aeron.conductorInvoker.start();
@@ -296,6 +309,8 @@ public final class Aeron implements AutoCloseable
      */
     public ConcurrentPublication addPublication(final String channel, final int streamId)
     {
+        // 委托给 ClientConductor：向 Driver 发送 ADD_PUBLICATION 命令，阻塞等待响应，
+        // 然后 mmap Driver 创建的 LogBuffer 文件，构造 ConcurrentPublication 返回
         return conductor.addPublication(channel, streamId);
     }
 
@@ -1208,6 +1223,10 @@ public final class Aeron implements AutoCloseable
                 awaitingIdleStrategy = new SleepingMillisIdleStrategy(Configuration.AWAITING_IDLE_SLEEP_MS);
             }
 
+            // ==================== 连接到 Driver：通过 mmap CnC 文件建立共享内存通信 ====================
+            // connectToDriver() 会打开 <aeronDir>/cnc.dat，mmap 映射到进程地址空间，
+            // 校验 Driver 存活性（心跳检测），并初始化 toDriverBuffer（客户端→Driver 的命令 ring buffer）。
+            // 执行完后，cncByteBuffer / cncMetaDataBuffer / toDriverBuffer 三个字段已就绪。
             connectToDriver();
             filePageSize = driverFilePageSize(cncMetaDataBuffer);
 
@@ -1218,12 +1237,16 @@ public final class Aeron implements AutoCloseable
                     " <= keepAliveIntervalNs=" + keepAliveIntervalNs);
             }
 
+            // connectToDriver() 已经创建了 toDriverBuffer，这里是防御性检查（用户可能预先注入）
             if (null == toDriverBuffer)
             {
                 toDriverBuffer = new ManyToOneRingBuffer(
                     CncFileDescriptor.createToDriverBuffer(cncByteBuffer, cncMetaDataBuffer));
             }
 
+            // 创建 toClientBuffer：Driver → 客户端的响应/事件通道。
+            // 底层是 BroadcastReceiver（一写多读的广播 buffer），外层用 CopyBroadcastReceiver
+            // 包装以将消息拷贝到本地 scratch buffer，避免被后续写入覆盖。
             if (null == toClientBuffer)
             {
                 toClientBuffer = new CopyBroadcastReceiver(new BroadcastReceiver(
@@ -1231,6 +1254,8 @@ public final class Aeron implements AutoCloseable
                     new ExpandableArrayBuffer(CopyBroadcastReceiver.SCRATCH_BUFFER_LENGTH));
             }
 
+            // 创建 counters buffer：客户端与 Driver 共享的计数器区域，
+            // 用于流控位置追踪（pub-limit、sub-pos）、系统监控指标等，全部通过 mmap 共享内存实现零拷贝读写。
             if (countersMetaDataBuffer() == null)
             {
                 countersMetaDataBuffer(
@@ -1257,6 +1282,9 @@ public final class Aeron implements AutoCloseable
                 subscriberErrorHandler = errorHandler;
             }
 
+            // 创建 DriverProxy：封装了向 toDriverBuffer 写入命令消息的 API。
+            // clientId 通过 ring buffer 的 correlation counter 原子递增分配，全局唯一标识此客户端。
+            // 后续的 addPublication / addSubscription 等操作都通过 driverProxy 写入命令到共享内存。
             if (null == driverProxy)
             {
                 clientId = toDriverBuffer.nextCorrelationId();
@@ -2016,17 +2044,60 @@ public final class Aeron implements AutoCloseable
                 "\n}";
         }
 
+        /**
+         * 连接到 Media Driver 的核心方法。
+         * <p>
+         * <b>核心原理：</b>Aeron 客户端与 Media Driver 之间不使用 TCP/Socket，而是通过一个
+         * 内存映射文件（mmap）进行 IPC 通信。这个文件叫 <b>CnC（Command and Control）文件</b>，
+         * 默认路径为 {@code <aeronDirectory>/cnc.dat}。
+         * <p>
+         * CnC 文件的内存布局（见 {@link CncFileDescriptor}）：
+         * <pre>
+         *  +-----------------------------+
+         *  |        Meta Data            |  ← 版本号、各区段长度、Driver PID、心跳超时等
+         *  +-----------------------------+
+         *  |    to-driver Ring Buffer    |  ← 客户端 → Driver 的命令通道（ManyToOneRingBuffer）
+         *  +-----------------------------+
+         *  |   to-clients Broadcast Buf  |  ← Driver → 客户端 的响应/事件通道（BroadcastReceiver）
+         *  +-----------------------------+
+         *  |  Counters Metadata Buffer   |  ← 计数器标签
+         *  +-----------------------------+
+         *  |   Counters Values Buffer    |  ← 计数器数值
+         *  +-----------------------------+
+         *  |        Error Log            |  ← Driver 错误日志
+         *  +-----------------------------+
+         * </pre>
+         * <p>
+         * 本方法的职责：打开并 mmap 这个 CnC 文件，验证其有效性和 Driver 存活性，
+         * 最终拿到 toDriverBuffer（ManyToOneRingBuffer），后续所有客户端命令
+         * （addPublication、addSubscription 等）都写入这个 ring buffer，
+         * 由 Driver 的 Conductor 线程消费。
+         */
         private void connectToDriver()
         {
             final EpochClock clock = epochClock;
+            // 计算连接超时的绝对截止时间（当前时间 + driverTimeoutMs）
             final long deadlineMs = clock.time() + driverTimeoutMs();
+            // cncFile = new File(aeronDirectory, "cnc.dat")，即 Driver 创建的共享内存映射文件
             final File cncFile = cncFile();
 
+            // 循环直到成功获取到 toDriverBuffer（即与 Driver 的通信通道建立完成）
             while (null == toDriverBuffer)
             {
+                // ========== 第一步：等待 CnC 文件被 Driver 创建并 mmap 映射到内存 ==========
+                // awaitCncFileCreation 内部逻辑：
+                //   1. 轮询等待 cnc.dat 文件存在且长度 >= META_DATA_LENGTH
+                //   2. 用 FileChannel.map(READ_WRITE) 将整个文件映射为 MappedByteBuffer
+                //   3. 从映射的 buffer 中读取 CnC 版本号（volatile read），等待版本号 != 0（表示 Driver 已初始化完成）
+                //   4. 校验版本兼容性后，返回指向 metadata 区段的 UnsafeBuffer
+                // 超时则抛出 DriverTimeoutException
                 cncMetaDataBuffer = awaitCncFileCreation(cncFile, clock, deadlineMs);
+                // 拿到整个 CnC 文件的 MappedByteBuffer（所有区段共享同一块 mmap 内存）
                 cncByteBuffer = cncMetaDataBuffer.byteBuffer();
 
+                // ========== 第二步：校验 CnC 文件长度是否足够容纳所有区段 ==========
+                // metadata 中记录了各区段的长度，据此判断文件实际大小是否 >= 所有区段之和。
+                // 如果不满足，说明 Driver 正在初始化、文件尚未写完，释放并重试。
                 if (!CncFileDescriptor.isCncFileLengthSufficient(cncMetaDataBuffer, cncByteBuffer.capacity()))
                 {
                     BufferUtil.free(cncByteBuffer);
@@ -2037,9 +2108,19 @@ public final class Aeron implements AutoCloseable
                     continue;
                 }
 
+                // ========== 第三步：在 mmap 内存上创建 toDriver RingBuffer ==========
+                // createToDriverBuffer 根据 metadata 中记录的 offset 和 length，
+                // 在 cncByteBuffer 上切出 to-driver 区段，包装为 ManyToOneRingBuffer。
+                // 这个 ring buffer 是客户端向 Driver 发送命令的唯一通道：
+                //   - 多个客户端线程可并发写入（Many-To-One）
+                //   - Driver 的 Conductor 线程作为唯一消费者读取
+                //   - 底层通过 CAS 实现无锁并发写入
                 final ManyToOneRingBuffer ringBuffer = new ManyToOneRingBuffer(
                     CncFileDescriptor.createToDriverBuffer(cncByteBuffer, cncMetaDataBuffer));
 
+                // ========== 第四步：等待 Driver 的 Conductor 线程产生第一次心跳 ==========
+                // consumerHeartbeatTime 是 Driver Conductor 线程周期性写入的时间戳，
+                // 存储在 ring buffer 的 trailer 区域。值为 0 表示 Driver 尚未开始消费。
                 while (0 == ringBuffer.consumerHeartbeatTime())
                 {
                     if (clock.time() > deadlineMs)
@@ -2050,6 +2131,10 @@ public final class Aeron implements AutoCloseable
                     sleep(Configuration.AWAITING_IDLE_SLEEP_MS);
                 }
 
+                // ========== 第五步：校验 Driver 心跳是否在超时窗口内（判断 Driver 是否存活） ==========
+                // 如果最后一次心跳时间距离当前时间超过了 driverTimeoutMs，
+                // 说明这可能是一个已经死掉的旧 Driver 留下的残留 CnC 文件。
+                // 此时释放映射、短暂等待后重试（等待新 Driver 启动并覆盖 CnC 文件）。
                 final long timeMs = clock.time();
                 if (ringBuffer.consumerHeartbeatTime() < (timeMs - driverTimeoutMs()))
                 {
@@ -2066,6 +2151,12 @@ public final class Aeron implements AutoCloseable
                     continue;
                 }
 
+                // ========== 连接成功：保存 ring buffer 引用 ==========
+                // 至此，客户端已通过 mmap 成功"连接"到 Driver：
+                //   - toDriverBuffer: 客户端写命令 → Driver 读（ManyToOneRingBuffer）
+                //   - 后续在 conclude() 中还会创建 toClientBuffer（Driver 写响应 → 客户端读，BroadcastReceiver）
+                //   - 以及 counters buffer（共享计数器，用于流控、位置追踪等）
+                // 整个"连接"过程没有任何网络调用，完全基于共享内存（mmap），这是 Aeron 实现超低延迟 IPC 的关键。
                 toDriverBuffer = ringBuffer;
             }
         }

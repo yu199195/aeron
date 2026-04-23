@@ -54,7 +54,9 @@ public class HeaderWriter
     }
 
     /**
-     * Create a new {@link HeaderWriter} that is {@link ByteOrder} specific to the platform.
+     * 【工厂方法：创建平台字节序适配的 HeaderWriter】
+     * 根据当前平台字节序选择小端（HeaderWriter）或大端（NativeBigEndianHeaderWriter）实现。
+     * Publication 构造时调用一次，后续 offer 每次写帧头都用这个实例。
      *
      * @param defaultHeader for the stream.
      * @return a new {@link HeaderWriter} that is {@link ByteOrder} specific to the platform.
@@ -72,7 +74,15 @@ public class HeaderWriter
     }
 
     /**
-     * Write a header to the term buffer in {@link ByteOrder#LITTLE_ENDIAN} format using the minimum instructions.
+     * 【写帧头到 term buffer（小端版本）】在 appendUnfragmentedMessage / appendFragmentedMessage 中、
+     * 拷贝 payload 之前调用。只需 3 次 putLong 即可填完 32 字节帧头（极致减少指令数）。
+     * <p>
+     * 写入顺序的设计考量：
+     * 1. 第一个 putLongRelease 写入 version+flags+type 和一个 **负的** frameLength（-length）。
+     *    负值表示"帧尚未完成"，消费者看到负值会跳过。这保证了帧头可见但帧体尚未就绪时消费者不会误读。
+     * 2. storeStoreFence 确保后续写入在第一步之后。
+     * 3. 填入 sessionId + termOffset，以及 streamId + termId。
+     * 4. 最终由 frameLengthOrdered 将 length 从负值改为正值（release 语义），标志帧完全可读。
      *
      * @param termBuffer to be written to.
      * @param offset     at which the header should be written.
@@ -81,11 +91,17 @@ public class HeaderWriter
      */
     public void write(final UnsafeBuffer termBuffer, final int offset, final int length, final int termId)
     {
-        termBuffer.putLongRelease(offset + FRAME_LENGTH_FIELD_OFFSET, versionFlagsType | ((-length) & 0xFFFF_FFFFL));
-        VarHandle.storeStoreFence();
+        termBuffer.putLongRelease(                                      // 第1次写（release 语义）：帧头前 8 字节
+            offset + FRAME_LENGTH_FIELD_OFFSET,                         //   offset 0-3: frameLength（取负值 -length，表示帧尚未完成）
+            versionFlagsType | ((-length) & 0xFFFF_FFFFL));             //   offset 4-7: version + flags + type（从 defaultHeader 模板中预填）
+        VarHandle.storeStoreFence();                                    // store-store 屏障：确保上面的写入先于下面的写入
 
-        termBuffer.putLong(offset + TERM_OFFSET_FIELD_OFFSET, sessionId | offset);
-        termBuffer.putLong(offset + STREAM_ID_FIELD_OFFSET, (((long)termId) << 32) | streamId);
+        termBuffer.putLong(                                             // 第2次写：帧头 8-15 字节
+            offset + TERM_OFFSET_FIELD_OFFSET,                          //   offset 8-11: termOffset（当前帧在 term 中的起始偏移）
+            sessionId | offset);                                        //   offset 12-15: sessionId（从 defaultHeader 模板中预填）
+        termBuffer.putLong(                                             // 第3次写：帧头 16-23 字节
+            offset + STREAM_ID_FIELD_OFFSET,                            //   offset 16-19: streamId（从 defaultHeader 模板中预填）
+            (((long)termId) << 32) | streamId);                         //   offset 20-23: termId（当前 term 的标识）
     }
 }
 

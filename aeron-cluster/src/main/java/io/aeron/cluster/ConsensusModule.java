@@ -277,40 +277,106 @@ public final class ConsensusModule implements AutoCloseable
     private final AgentRunner conductorRunner;
     private final AgentInvoker conductorInvoker;
 
+    /**
+     * ConsensusModule 构造函数：初始化配置并创建核心 Agent。
+     * <p>
+     * <b>执行流程</b>：
+     * <ol>
+     *   <li>调用 {@link Context#conclude()} 完成配置初始化（创建目录、连接 Aeron、分配计数器等）</li>
+     *   <li>创建 {@link ConsensusModuleAgent}（核心状态机，负责 Raft 选举、日志复制、会话管理）</li>
+     *   <li>根据配置选择 Runner 或 Invoker 模式：
+     *       <ul>
+     *         <li><b>Invoker 模式</b>：由外部驱动（共享线程，适合嵌入式场景）</li>
+     *         <li><b>Runner 模式</b>：独立线程运行（生产环境推荐）</li>
+     *       </ul>
+     *   </li>
+     * </ol>
+     * <p>
+     * <b>异常处理</b>：
+     * <ul>
+     *   <li>如果初始化失败，会标记 {@link ClusterMarkFile} 为失败状态（供监控工具检测）</li>
+     *   <li>清理已分配的资源后重新抛出异常</li>
+     * </ul>
+     *
+     * @param ctx 配置参数上下文（必须包含集群成员、工作目录等必要配置）
+     * @throws ConcurrentConcludeException 如果配置已被并发初始化
+     * @throws ClusterException 如果配置无效或资源创建失败
+     */
     ConsensusModule(final Context ctx)
     {
         try
         {
-            ctx.conclude();
+            // ==================== 步骤 1: 配置初始化（核心逻辑） ====================
+            // conclude() 负责：
+            // - 校验配置参数（clusterMembers、serviceCount 等）
+            // - 创建工作目录（clusterDir、markFileDir）
+            // - 连接到 Aeron MediaDriver
+            // - 初始化 RecordingLog（持久化日志元数据）
+            // - 分配所有计数器（用于监控和状态追踪）
+            // - 创建 Archive 客户端（用于日志录制）
+            ctx.conclude();  // ← 详见 Context.conclude() 方法（400+ 行核心逻辑）
+
+            // 保存配置上下文
             this.ctx = ctx;
 
-            conductor = new ConsensusModuleAgent(ctx);
+            // ==================== 步骤 2: 创建 ConsensusModuleAgent ====================
+            // ConsensusModuleAgent 是核心状态机，负责：
+            // - Raft 选举（Election）
+            // - 日志复制（Log Replication）
+            // - 会话管理（Session Management）
+            // - 快照保存（Snapshot）
+            // - 定时器调度（Timer Service）
+            conductor = new ConsensusModuleAgent(ctx);  // ← 详见 ConsensusModuleAgent 构造函数
 
-            if (ctx.useAgentInvoker())
+            // ==================== 步骤 3: 选择运行模式 ====================
+            // 根据 ctx.useAgentInvoker() 决定使用 Runner 还是 Invoker
+
+            if (ctx.useAgentInvoker())  // ← Invoker 模式
             {
+                // Invoker 模式：由外部驱动（如 ClusteredMediaDriver 共享线程）
+                // - errorHandler: 错误处理器（记录到 Mark File 错误缓冲区）
+                // - errorCounter: 错误计数器（用于监控）
+                // - conductor: ConsensusModuleAgent 实例
+                // 使用方式：外部调用 conductorInvoker.invoke() 执行一次 doWork()
                 conductorInvoker = new AgentInvoker(ctx.errorHandler(), ctx.errorCounter(), conductor);
-                conductorRunner = null;
+                conductorRunner = null;  // ← Runner 为 null
             }
-            else
+            else  // ← Runner 模式（默认，生产环境推荐）
             {
+                // Runner 模式：独立线程运行
+                // - idleStrategy: 空闲策略（如 BackoffIdleStrategy，无工作时降低 CPU 占用）
+                // - errorHandler: 错误处理器
+                // - errorCounter: 错误计数器
+                // - conductor: ConsensusModuleAgent 实例
+                // 使用方式：AgentRunner.startOnThread() 在新线程上启动，持续执行 doWork()
                 conductorRunner = new AgentRunner(
                     ctx.idleStrategy(), ctx.errorHandler(), ctx.errorCounter(), conductor);
-                conductorInvoker = null;
+                conductorInvoker = null;  // ← Invoker 为 null
             }
         }
         catch (final ConcurrentConcludeException ex)
         {
+            // ==================== 并发异常 ====================
+            // 配置已被其他线程并发初始化，直接抛出
+            // 这通常表示编程错误（多线程同时调用 launch()）
             throw ex;
         }
         catch (final Exception ex)
         {
+            // ==================== 初始化失败处理 ====================
+            // 初始化失败时，标记 Mark File 为失败状态
             final ClusterMarkFile markFile = ctx.markFile;
             if (null != markFile)
             {
+                // 写入失败标记，供监控工具检测（如 aeron-stat）
+                // 这样管理员可以通过 Mark File 知道节点启动失败的原因
                 markFile.signalFailedStart();
             }
 
+            // 清理已分配的资源（关闭 Aeron 连接、RecordingLog 等）
             CloseHelper.quietClose(ctx::close);
+
+            // 重新抛出异常，让调用者知道启动失败
             throw ex;
         }
     }
@@ -326,24 +392,81 @@ public final class ConsensusModule implements AutoCloseable
     }
 
     /**
-     * Launch an {@link ConsensusModule} by providing a configuration context.
+     * 通过提供配置上下文启动 {@link ConsensusModule}。
+     * <p>
+     * 这是 Aeron Cluster 共识模块的主要入口点，负责：
+     * <ul>
+     *   <li>初始化配置（调用 {@link Context#conclude()}）</li>
+     *   <li>创建 {@link ConsensusModuleAgent}（核心状态机）</li>
+     *   <li>启动 Agent（Runner 或 Invoker 模式）</li>
+     * </ul>
+     * <p>
+     * <b>启动流程</b>：
+     * <pre>
+     * 1. 调用构造函数 new ConsensusModule(ctx)
+     *    ├─ ctx.conclude()：完成配置初始化
+     *    │   ├─ 创建工作目录（cluster-dir、mark-file-dir）
+     *    │   ├─ 连接到 Aeron MediaDriver
+     *    │   ├─ 初始化 RecordingLog（持久化日志元数据）
+     *    │   ├─ 分配计数器（用于监控）
+     *    │   └─ 创建 Archive 客户端
+     *    └─ new ConsensusModuleAgent(ctx)：创建核心状态机
      *
-     * @param ctx for the configuration parameters.
-     * @return a new instance of an {@link ConsensusModule}.
+     * 2. 启动 Agent（两种模式）
+     *    ├─ Runner 模式（默认）：AgentRunner.startOnThread() - 在独立线程上运行
+     *    └─ Invoker 模式：conductorInvoker.start() - 由外部调用者驱动
+     * </pre>
+     * <p>
+     * <b>线程模型</b>：
+     * <ul>
+     *   <li><b>Runner 模式</b>：Agent 在新线程上启动，持续执行 doWork()，适合生产环境</li>
+     *   <li><b>Invoker 模式</b>：Agent 由外部驱动（通过 invoke()），适合共享线程的嵌入式场景</li>
+     * </ul>
+     *
+     * @param ctx 配置参数上下文（必须包含集群成员、工作目录等必要配置）
+     * @return 新创建并已启动的 {@link ConsensusModule} 实例
+     * @throws ClusterException 如果配置无效或启动失败
      */
     public static ConsensusModule launch(final Context ctx)
     {
+        // ==================== 步骤 1: 创建 ConsensusModule 实例 ====================
+        // 内部调用 new ConsensusModule(ctx)，完成以下工作：
+        // 1. ctx.conclude()：初始化所有配置
+        // 2. new ConsensusModuleAgent(ctx)：创建核心状态机
+        // 3. 创建 Runner 或 Invoker（根据配置）
         final ConsensusModule consensusModule = new ConsensusModule(ctx);
 
-        if (null != consensusModule.conductorRunner)
+        // ==================== 步骤 2: 选择启动模式 ====================
+        // 两种模式：
+        // 1. Runner 模式：独立线程运行（生产环境）
+        // 2. Invoker 模式：由外部调用者驱动（嵌入式或测试环境）
+
+        if (null != consensusModule.conductorRunner)  // ← Runner 模式
         {
+            // 在独立线程上启动 ConsensusModuleAgent
+            // - threadFactory: 用于创建新线程（可自定义线程名、优先级等）
+            // - conductorRunner: 包装了 Agent 的执行器，持续调用 doWork()
+            // 线程启动后会执行：
+            // while (running) {
+            //     conductor.doWork();  // ← ConsensusModuleAgent.doWork()
+            //     idleStrategy.idle(); // ← 无工作时的空闲策略
+            // }
             AgentRunner.startOnThread(consensusModule.conductorRunner, ctx.threadFactory());
         }
-        else
+        else  // ← Invoker 模式
         {
+            // 启动 Invoker（不创建新线程）
+            // 由外部通过 conductorInvoker.invoke() 驱动
+            // 适用场景：
+            // - ClusteredMediaDriver：所有组件共享一个线程
+            // - 测试环境：精确控制执行时机
             consensusModule.conductorInvoker.start();
         }
 
+        // ==================== 步骤 3: 返回实例 ====================
+        // 此时 ConsensusModule 已经启动：
+        // - Agent 开始执行 onStart()（连接 Archive、恢复状态、启动选举）
+        // - 随后进入主循环 doWork()（处理选举、日志复制、会话管理）
         return consensusModule;
     }
 
@@ -1661,40 +1784,94 @@ public final class ConsensusModule implements AutoCloseable
         }
 
         /**
-         * Conclude configuration by setting up defaults when specifics are not provided.
+         * 完成配置初始化：在用户未提供时设置默认值，创建必要的资源。
+         * <p>
+         * 这是 ConsensusModule 启动前的<b>关键步骤</b>，负责：
+         * <ul>
+         *   <li>校验配置参数（如集群成员、通道配置）</li>
+         *   <li>创建工作目录（cluster-dir、mark-file-dir）</li>
+         *   <li>连接到 Aeron MediaDriver</li>
+         *   <li>初始化 RecordingLog（持久化日志元数据）</li>
+         *   <li>分配计数器（用于监控和状态追踪）</li>
+         *   <li>创建 Archive 客户端（用于日志录制）</li>
+         * </ul>
+         * <p>
+         * <b>执行顺序</b>：
+         * <pre>
+         * 1. 并发检查（确保只执行一次）
+         * 2. 参数校验（clusterMembers、serviceCount、超时配置等）
+         * 3. 目录创建（clusterDir、markFileDir）
+         * 4. 时钟初始化（clusterClock、epochClock）
+         * 5. Mark File 创建（进程协调、错误缓冲区）
+         * 6. NodeStateFile 创建（持久化 candidateTermId）
+         * 7. 错误处理初始化（errorLog、errorHandler）
+         * 8. RecordingLog 创建（持久化 term 和 snapshot 元数据）
+         * 9. 连接 Aeron（创建 Aeron 客户端）
+         * 10. 分配所有计数器（moduleState、electionState、commitPosition 等）
+         * 11. 创建 AeronArchive.Context（Archive 控制通道）
+         * 12. 初始化认证与授权（Authenticator、AuthorisationService）
+         * </pre>
+         * <p>
+         * <b>重要约束</b>：
+         * <ul>
+         *   <li>此方法只能被调用一次（通过 VarHandle 原子操作保证）</li>
+         *   <li>必须在 ConsensusModule 构造函数中调用</li>
+         *   <li>如果配置无效或资源创建失败，会抛出异常</li>
+         * </ul>
+         *
+         * @throws ConcurrentConcludeException 如果 conclude() 被并发调用
+         * @throws ClusterException 如果配置无效或资源创建失败
+         * @throws UncheckedIOException 如果目录操作失败
          */
         @SuppressWarnings("MethodLength")
         public void conclude()
         {
+            // ==================== 步骤 1: 并发检查 ====================
+            // 使用 VarHandle 原子操作确保 conclude() 只执行一次
+            // IS_CONCLUDED_VH: VarHandle 指向 isConcluded 字段
+            // getAndSet(this, true): 原子地设置为 true 并返回旧值
             if ((boolean)IS_CONCLUDED_VH.getAndSet(this, true))
             {
+                // 如果已经执行过（旧值为 true），抛出并发异常
+                // 这通常表示编程错误（多线程同时调用 launch()）
                 throw new ConcurrentConcludeException();
             }
 
-            validateLogChannel();
+            // ==================== 步骤 2: 参数校验 ====================
 
+            // 2.1 校验日志通道配置
+            validateLogChannel();  // ← 确保 logChannel 格式正确（如 "aeron:udp?..."）
+
+            // 2.2 校验 Service 数量（必须在 [0, MAX_SERVICE_COUNT] 范围内）
             if (serviceCount < 0 || serviceCount > MAX_SERVICE_COUNT)
             {
                 throw new ClusterException("service count of range [0, " + MAX_SERVICE_COUNT + "]: " + serviceCount);
             }
 
+            // ==================== 步骤 3: 目录初始化 ====================
+
+            // 3.1 创建集群工作目录
             if (null == clusterDir)
             {
                 clusterDir = new File(clusterDirectoryName);
             }
 
+            // 3.2 创建 Mark File 目录（可能与 clusterDir 相同）
             if (null == markFileDir)
             {
                 final String dir = ClusteredServiceContainer.Configuration.markFileDir();
                 markFileDir = Strings.isEmpty(dir) ? clusterDir : new File(dir);
             }
 
+            // 3.3 获取目录的标准路径（绝对路径）
             try
             {
+                // getCanonicalFile(): 解析符号链接和相对路径为绝对路径
                 clusterDir = clusterDir.getCanonicalFile();
                 clusterDirectoryName = clusterDir.getAbsolutePath();
                 markFileDir = markFileDir.getCanonicalFile();
 
+                // 3.4 设置 Service 目录（通常与 clusterDir 相同）
                 if (Strings.isEmpty(clusterServicesDirectoryName))
                 {
                     clusterServicesDirectoryName = clusterDirectoryName;
@@ -1709,19 +1886,27 @@ public final class ConsensusModule implements AutoCloseable
                 throw new UncheckedIOException(ex);
             }
 
+            // 3.5 校验集群成员配置（必需）
             if (null == clusterMembers)
             {
+                // clusterMembers 格式示例：
+                // "0,node0:20000,node0:20001,node0:20002,node0:20003,node0:8010|..."
                 throw new ClusterException("ConsensusModule.Context.clusterMembers must be set");
             }
 
+            // 3.6 可选：删除旧目录（测试环境）
             if (deleteDirOnStart)
             {
-                IoUtil.delete(clusterDir, false);
+                IoUtil.delete(clusterDir, false);  // ← 递归删除旧数据
             }
 
+            // 3.7 确保目录存在
             IoUtil.ensureDirectoryExists(clusterDir, "cluster");
             IoUtil.ensureDirectoryExists(markFileDir, "mark file");
 
+            // ==================== 步骤 4: 超时参数校验 ====================
+            // startupCanvassTimeoutNs 必须是 leaderHeartbeatTimeoutNs 的 2 倍以上
+            // 这样才能在启动时有足够时间完成选举
             if (startupCanvassTimeoutNs / leaderHeartbeatTimeoutNs < 2)
             {
                 throw new ClusterException(
@@ -1729,12 +1914,17 @@ public final class ConsensusModule implements AutoCloseable
                     " must be a multiple of leaderHeartbeatTimeoutNs=" + leaderHeartbeatTimeoutNs);
             }
 
+            // ==================== 步骤 5: 初始化时钟 ====================
+
+            // 5.1 集群时钟（用于确定性时间）
             if (null == clusterClock)
             {
+                // 从系统属性读取时钟类名（默认 MillisecondClusterClock）
                 final String clockClassName = System.getProperty(
                     CLUSTER_CLOCK_PROP_NAME, MillisecondClusterClock.class.getName());
                 try
                 {
+                    // 反射创建时钟实例
                     clusterClock = (ClusterClock)Class.forName(clockClassName).getConstructor().newInstance();
                 }
                 catch (final Exception e)
@@ -1743,44 +1933,62 @@ public final class ConsensusModule implements AutoCloseable
                 }
             }
 
+            // 5.2 Epoch 时钟（用于超时计算、Mark File 活跃性检测）
             if (null == epochClock)
             {
                 epochClock = SystemEpochClock.INSTANCE;
             }
 
+            // 5.3 应用版本校验器（用于检查集群节点版本兼容性）
             if (null == appVersionValidator)
             {
                 appVersionValidator = AppVersionValidator.SEMANTIC_VERSIONING_VALIDATOR;
             }
 
+            // 5.4 集群时间消费者（用于监听集群时间更新）
             if (null == clusterTimeConsumerSupplier)
             {
                 clusterTimeConsumerSupplier = (ctx) -> (timestamp) -> {};
             }
 
+            // ==================== 步骤 6: 创建 Mark File ====================
+            // Mark File 用于：
+            // - 进程间协调（防止多进程启动同一集群）
+            // - 错误日志缓冲区（保存最近的错误信息）
+            // - 活跃性检测（由外部监控工具读取）
             if (null == markFile)
             {
+                // 获取文件页大小（用于内存映射文件）
                 final int filePageSize = null != aeron ? aeron.context().filePageSize() :
                     driverFilePageSize(new File(aeronDirectoryName), epochClock, new CommonContext().driverTimeoutMs());
+
+                // 创建 Mark File
                 markFile = new ClusterMarkFile(
-                    new File(markFileDir, ClusterMarkFile.FILENAME),
-                    ClusterComponentType.CONSENSUS_MODULE,
-                    errorBufferLength,
-                    epochClock,
-                    ClusteredServiceContainer.Configuration.LIVENESS_TIMEOUT_MS,
-                    filePageSize);
+                    new File(markFileDir, ClusterMarkFile.FILENAME),  // ← 文件路径
+                    ClusterComponentType.CONSENSUS_MODULE,            // ← 组件类型
+                    errorBufferLength,                                // ← 错误缓冲区大小
+                    epochClock,                                        // ← 时钟
+                    ClusteredServiceContainer.Configuration.LIVENESS_TIMEOUT_MS,  // ← 活跃超时
+                    filePageSize);                                    // ← 文件页大小
             }
 
+            // 创建 Mark File 链接（供外部工具读取）
             MarkFile.ensureMarkFileLink(
                 clusterDir,
                 new File(markFile.parentDirectory(), ClusterMarkFile.FILENAME),
                 ClusterMarkFile.LINK_FILENAME);
 
+            // ==================== 步骤 7: 创建 NodeStateFile ====================
+            // NodeStateFile 持久化节点状态（如 candidateTermId）
+            // 这样节点重启后可以恢复上次的 term ID
             if (null == nodeStateFile)
             {
                 try
                 {
-                    nodeStateFile = new NodeStateFile(clusterDir, true, fileSyncLevel());
+                    nodeStateFile = new NodeStateFile(
+                        clusterDir,
+                        true,  // ← 创建新文件（如果不存在）
+                        fileSyncLevel());  // ← 文件同步级别（0=不同步, 1=正常, 2=强制）
                 }
                 catch (final IOException ex)
                 {
@@ -1788,26 +1996,42 @@ public final class ConsensusModule implements AutoCloseable
                 }
             }
 
+            // 迁移 candidateTermId（从 Mark File 到 NodeStateFile）
+            // 旧版本 Aeron 将 candidateTermId 保存在 Mark File 中
+            // 新版本改为保存在 NodeStateFile 中，这里做兼容性迁移
             if (Aeron.NULL_VALUE == nodeStateFile.candidateTerm().candidateTermId() &&
                 Aeron.NULL_VALUE != markFile.candidateTermId())
             {
                 nodeStateFile.updateCandidateTermId(markFile.candidateTermId(), Aeron.NULL_VALUE, epochClock.time());
             }
 
+            // ==================== 步骤 8: 初始化错误处理 ====================
+
+            // 8.1 创建错误日志（写入 Mark File 的错误缓冲区）
             if (null == errorLog)
             {
-                errorLog = new DistinctErrorLog(markFile.errorBuffer(), epochClock, StandardCharsets.US_ASCII);
+                errorLog = new DistinctErrorLog(
+                    markFile.errorBuffer(),  // ← 错误缓冲区（内存映射）
+                    epochClock,              // ← 时钟（用于错误时间戳）
+                    StandardCharsets.US_ASCII);  // ← 字符编码
             }
 
+            // 8.2 设置错误处理器（如果用户未提供，使用默认的打印到 errorLog）
             errorHandler = CommonContext.setupErrorHandler(errorHandler, errorLog);
 
+            // ==================== 步骤 9: 创建 RecordingLog ====================
+            // RecordingLog 持久化日志元数据（term、snapshot）
+            // 注意：不是日志内容本身（日志内容由 Archive 录制）
             if (null == recordingLog)
             {
-                recordingLog = new RecordingLog(clusterDir, true);
+                recordingLog = new RecordingLog(clusterDir, true);  // ← 可写模式
             }
 
+            // ==================== 步骤 10: 设置 Agent 角色名 ====================
             if (Strings.isEmpty(agentRoleName))
             {
+                // 角色名格式：consensus-module-{clusterId}-{clusterMemberId}
+                // 示例：consensus-module-0-0
                 agentRoleName = "consensus-module-" + clusterId + "-" + clusterMemberId;
             }
 

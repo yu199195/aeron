@@ -405,7 +405,7 @@ public abstract class Publication implements AutoCloseable
      */
     public final long offer(final DirectBuffer buffer)
     {
-        return offer(buffer, 0, buffer.capacity());
+        return offer(buffer, 0, buffer.capacity());                     // 发送整个 buffer：offset=0, length=buffer.capacity()
     }
 
     /**
@@ -419,7 +419,7 @@ public abstract class Publication implements AutoCloseable
      */
     public final long offer(final DirectBuffer buffer, final int offset, final int length)
     {
-        return offer(buffer, offset, length, null);
+        return offer(buffer, offset, length, null);                     // 转发给四参数 offer，reservedValueSupplier 默认为 null
     }
 
     /**
@@ -652,21 +652,33 @@ public abstract class Publication implements AutoCloseable
         return logBuffers;
     }
 
+    /**
+     * 判断 offer 失败时的具体原因（背压 / 未连接 / 超限）。
+     * 当 position 已 >= limit 时由 offer 调用：
+     * 1. 若即将越过 maxPossiblePosition → MAX_POSITION_EXCEEDED
+     * 2. 若 logMetaData 标记为已连接 → BACK_PRESSURED（流控窗口满，订阅者消费慢）
+     * 3. 否则 → NOT_CONNECTED（无活跃订阅者）
+     */
     final long backPressureStatus(final long currentPosition, final int messageLength)
     {
-        if ((currentPosition + align(messageLength + HEADER_LENGTH, FRAME_ALIGNMENT)) >= maxPossiblePosition)
+        if ((currentPosition +                                          // 当前 position + 本消息对齐后帧长
+            align(messageLength + HEADER_LENGTH, FRAME_ALIGNMENT))      //   = 若写入成功后将到达的 position
+            >= maxPossiblePosition)                                     // 若已达到/超过流的最大 position（termLength * 2^31）
         {
-            return MAX_POSITION_EXCEEDED;
+            return MAX_POSITION_EXCEEDED;                               // 流已耗尽，无法继续写入
         }
 
-        if (LogBufferDescriptor.isConnected(logMetaDataBuffer))
+        if (LogBufferDescriptor.isConnected(logMetaDataBuffer))         // volatile 读 metadata 中的 isConnected 标志
         {
-            return BACK_PRESSURED;
+            return BACK_PRESSURED;                                      // 有订阅者但流控窗口满 → 背压，调用方应 idle/backoff 后重试
         }
 
-        return NOT_CONNECTED;
+        return NOT_CONNECTED;                                           // 无活跃订阅者 → 未连接，调用方应等待连接建立
     }
 
+    /**
+     * 校验消息长度不为负数；由单帧写入（appendUnfragmentedMessage）前调用。
+     */
     final void checkPositiveLength(final int length)
     {
         if (length < 0)
@@ -675,6 +687,9 @@ public abstract class Publication implements AutoCloseable
         }
     }
 
+    /**
+     * 校验 tryClaim 的 payload 长度：不为负且不超过单帧最大载荷（MTU - 帧头）。
+     */
     final void checkPayloadLength(final int length)
     {
         if (length < 0)
@@ -689,6 +704,10 @@ public abstract class Publication implements AutoCloseable
         }
     }
 
+    /**
+     * 校验消息总长度不超过 maxMessageLength（termLength/8，上限 16MB）；
+     * 由分片写入（appendFragmentedMessage）前调用。
+     */
     final void checkMaxMessageLength(final int length)
     {
         if (length > maxMessageLength)
@@ -698,6 +717,9 @@ public abstract class Publication implements AutoCloseable
         }
     }
 
+    /**
+     * 校验两段 buffer 的长度均非负且相加不溢出，返回总长度。用于双 buffer offer 重载。
+     */
     static int validateAndComputeLength(final int lengthOne, final int lengthTwo)
     {
         if (lengthOne < 0)

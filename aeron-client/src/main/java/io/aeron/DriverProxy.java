@@ -70,29 +70,38 @@ public final class DriverProxy
     }
 
     /**
-     * Instruct the driver to add a concurrent publication.
+     * 向 Driver 发送 ADD_PUBLICATION 命令。
+     * 实际上是将命令编码后写入 CnC 文件中的 to-driver ManyToOneRingBuffer。
+     * Driver Conductor 线程会周期性消费该 RingBuffer 中的消息来处理命令。
      *
-     * @param channel  uri in string format.
-     * @param streamId within the channel.
-     * @return the correlation id for the command.
+     * @param channel  通道 URI 字符串（如 "aeron:udp?endpoint=localhost:40123" 或 "aeron:ipc"）
+     * @param streamId 通道内的流 ID
+     * @return correlationId（命令唯一标识，Client 用它匹配 Driver 的响应）
      */
     public long addPublication(final String channel, final int streamId)
     {
+        // 从 RingBuffer metadata 区域通过 CAS 原子递增获取全局唯一的 correlationId
         final long correlationId = toDriverCommandBuffer.nextCorrelationId();
+        // 计算消息总长度：固定头部字段 + channel 字符串的变长部分
         final int length = PublicationMessageFlyweight.computeLength(channel.length());
+        // 在 RingBuffer 中 claim 一块空间，msgTypeId = ADD_PUBLICATION 供 Driver 端按类型分发
+        // 返回值 < 0 表示 RingBuffer 已满（Client 命令发送过快或 Driver 消费不及时）
         final int index = toDriverCommandBuffer.tryClaim(ADD_PUBLICATION, length);
         if (index < 0)
         {
             throw new AeronException("failed to write add publication command");
         }
 
+        // 通过 Flyweight 模式直接在 RingBuffer 底层 buffer 上零拷贝编码消息字段，
+        // 避免额外的对象分配和序列化开销
         publicationMessageFlyweight
-            .wrap(toDriverCommandBuffer.buffer(), index)
-            .streamId(streamId)
-            .channel(channel)
-            .clientId(clientId)
-            .correlationId(correlationId);
+            .wrap(toDriverCommandBuffer.buffer(), index)  // 包裹到 claim 的起始位置
+            .streamId(streamId)                            // 流 ID
+            .channel(channel)                              // 通道 URI 字符串
+            .clientId(clientId)                            // 标识发送命令的 Client
+            .correlationId(correlationId);                 // 命令唯一标识
 
+        // 提交消息：设置 record header 的长度字段为正值，使 Driver 可见并可消费
         toDriverCommandBuffer.commit(index);
 
         return correlationId;
@@ -156,23 +165,40 @@ public final class DriverProxy
     }
 
     /**
-     * Instruct the driver to add a subscription.
+     * 向 Driver 发送 ADD_SUBSCRIPTION 命令。
+     * <p>
+     * 底层机制：通过 CnC 共享内存中的 ManyToOneRingBuffer（toDriverCommandBuffer）写入命令。
+     * 采用 tryClaim → 填充 → commit 的三阶段无锁写入协议：
+     * <ol>
+     *   <li>tryClaim：用 CAS 在 ring buffer 中原子地预留一段空间，返回写入位置 index</li>
+     *   <li>Flyweight 填充：将命令字段直接写入 ring buffer 底层的 mmap 内存（零拷贝）</li>
+     *   <li>commit：写入消息头的 length 字段（volatile write），使 Driver 的 Conductor 线程可见</li>
+     * </ol>
      *
-     * @param channel  uri in string format.
-     * @param streamId within the channel.
-     * @return the correlation id for the command.
+     * @param channel  通道 URI，如 "aeron:udp?endpoint=localhost:40123"
+     * @param streamId 通道内的流 ID
+     * @return correlationId，全局唯一标识此命令，用于匹配 Driver 的异步响应
      */
     public long addSubscription(final String channel, final int streamId)
     {
         final long registrationId = Aeron.NULL_VALUE;
+        // 原子递增分配一个全局唯一的 correlationId（存储在 ring buffer trailer 的 correlation counter 中）
         final long correlationId = toDriverCommandBuffer.nextCorrelationId();
+        // 计算 SubscriptionMessageFlyweight 序列化后的字节长度（固定头 + channel 字符串长度）
         final int length = SubscriptionMessageFlyweight.computeLength(channel.length());
+
+        // tryClaim：在 ring buffer 中用 CAS 原子预留 length 字节空间
+        // 成功返回写入起始 index；失败（buffer 满）返回负值
+        // 消息类型 ADD_SUBSCRIPTION (0x04) 会写入消息头，Driver 据此分发到对应的处理方法
         final int index = toDriverCommandBuffer.tryClaim(ADD_SUBSCRIPTION, length);
         if (index < 0)
         {
             throw new AeronException("failed to write add subscription command");
         }
 
+        // 用 Flyweight 模式直接在 ring buffer 的 mmap 内存上序列化命令字段（零拷贝，无中间对象）
+        // Flyweight 消息布局：
+        //   [clientId (8B)] [correlationId (8B)] [registrationCorrelationId (8B)] [streamId (4B)] [channel (变长)]
         subscriptionMessageFlyweight
             .wrap(toDriverCommandBuffer.buffer(), index)
             .registrationCorrelationId(registrationId)
@@ -181,6 +207,8 @@ public final class DriverProxy
             .clientId(clientId)
             .correlationId(correlationId);
 
+        // commit：对消息头的 length 字段执行 volatile write（putIntOrdered），
+        // 构成 happens-before 关系，保证 Driver 读到 length 时所有字段已可见
         toDriverCommandBuffer.commit(index);
 
         return correlationId;

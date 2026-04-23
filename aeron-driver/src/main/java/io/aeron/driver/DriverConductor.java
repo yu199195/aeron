@@ -1240,20 +1240,31 @@ public final class DriverConductor implements Agent
 
     /**
      * 【处理 ADD_SUBSCRIPTION 命令（网络类型）】
-     * 当 Client 调用 aeron.addSubscription("aeron:udp?endpoint=...", streamId) 时触发。
-     *
-     * 核心流程：
-     * 1. 异步解析 channel URI，得到 UdpChannel
-     * 2. 获取或创建 ReceiveChannelEndpoint（复用同一 UDP Socket 接收多个 stream）
-     * 3. 通过 ReceiverProxy 通知 Receiver Agent 注册 subscription（在 Receiver 线程中添加到 dispatcher）
-     * 4. 通过 clientProxy 向 Client 回写 SUBSCRIPTION_READY 事件
-     * 5. 关联已有匹配的 Image（如果 Publication 端已在发送）
+     * 当 Client 调用 aeron.addSubscription("aeron:udp?endpoint=localhost:40123", streamId) 时触发。
+     * <p>
+     * 完整流程：
+     * <pre>
+     *  1. UdpChannel.parse()     ─ 解析 URI → 得到 remoteData=localhost:40123 等地址信息
+     *  2. getOrCreateReceive     ─ 获取/创建 ReceiveChannelEndpoint:
+     *     ChannelEndpoint()          a. new ReceiveChannelEndpoint(udpChannel, dispatcher, ...)
+     *                                b. openChannel() → DatagramChannel.open() + bind(localhost:40123)
+     *                                c. receiverProxy.registerReceiveChannelEndpoint()
+     *                                   → Receiver 线程中: channel.register(selector, OP_READ)
+     *  3. addNetworkSubscription ─ 通过 ReceiverProxy 将 streamId 注册到 DataPacketDispatcher
+     *     ToReceiver()              Receiver 线程收包后按 streamId 分发到 PublicationImage
+     *  4. clientProxy.on         ─ 向 Client 回写 ON_SUBSCRIPTION_READY（通过 CnC toClientsBuffer）
+     *     SubscriptionReady()
+     *  5. linkMatchingImages()   ─ 如果已有匹配的 Publisher，立即发送 ON_AVAILABLE_IMAGE
+     * </pre>
      */
     void onAddNetworkSubscription(
         final String channel, final int streamId, final long registrationId, final long clientId)
     {
         executeAsyncClientTask(
             registrationId,
+            // ① 异步解析 channel URI
+            //    "aeron:udp?endpoint=localhost:40123" → UdpChannel 对象
+            //    其中 remoteData = InetSocketAddress("localhost", 40123) → 这就是要绑定的 UDP 地址
             () -> UdpChannel.parse(channel, nameResolver, false),
             (asyncResult) ->
             {
@@ -1268,10 +1279,13 @@ public final class DriverConductor implements Agent
                     SubscriptionParams.getSubscriptionParams(udpChannel.channelUri(), ctx, 0);
                 checkForClashingSubscription(params, udpChannel, streamId);
 
-                // 获取或创建 ReceiveChannelEndpoint：同一 UDP 地址复用同一个 endpoint
+                // ② 获取或创建 ReceiveChannelEndpoint
+                //    如果 localhost:40123 已有 endpoint → 复用（多个 subscription 共享同一 UDP socket）
+                //    如果没有 → 创建新的 DatagramChannel, bind 端口, 注册到 Receiver 的 NIO Selector
                 final ReceiveChannelEndpoint channelEndpoint = getOrCreateReceiveChannelEndpoint(
                     params, udpChannel, registrationId);
 
+                // ③ 创建 NetworkSubscriptionLink：关联 channelEndpoint + streamId + client
                 final NetworkSubscriptionLink subscription = new NetworkSubscriptionLink(
                     registrationId, channelEndpoint, streamId, channel, getOrAddClient(clientId), params);
 
@@ -1283,12 +1297,17 @@ public final class DriverConductor implements Agent
                 }
                 else
                 {
-                    // 通过 ReceiverProxy 将 subscription 注册到 Receiver Agent
+                    // ④ 将 streamId 注册到 Receiver 线程的 DataPacketDispatcher
+                    //    Receiver 收到 UDP 包后，根据包头中的 streamId 分发到对应的处理器
+                    //    如果是该 endpoint 上第一个该 streamId 的 subscription，才需要真正注册
                     addNetworkSubscriptionToReceiver(subscription);
                 }
 
+                // ⑤ 向 Client 回写 ON_SUBSCRIPTION_READY
                 clientProxy.onSubscriptionReady(registrationId, channelEndpoint.statusIndicatorCounter().id());
-                linkMatchingImages(subscription);  // 关联已有的匹配 Image
+
+                // ⑥ 检查是否已有匹配的 Publisher 正在发送，如果有则立即通知 Client "Image 可用"
+                linkMatchingImages(subscription);
             });
     }
 
@@ -1977,6 +1996,11 @@ public final class DriverConductor implements Agent
         return null;
     }
 
+    /**
+     * 创建一个新的 NetworkPublication 实例。
+     * 包括：分配 LogBuffer 文件、创建 FlowControl、分配各种 Counter、构造 Publication 对象，
+     * 并注册到 Sender 线程以开始网络发送。
+     */
     @SuppressWarnings("MethodLength")
     private NetworkPublication newNetworkPublication(
         final long registrationId,
@@ -1996,6 +2020,9 @@ public final class DriverConductor implements Agent
 
         final String canonicalForm = udpChannel.canonicalForm();
 
+        // 创建 FlowControl 实例：控制发送速率，防止接收端被淹没
+        // 多播/多目标 → multicastFlowControlSupplier（如 MinMulticastFlowControl，取最慢接收者的位置）
+        // 单播 → unicastFlowControlSupplier（如 MaxFlowControl，只跟踪单个接收者）
         final FlowControl flowControl = udpChannel.isMulticast() || udpChannel.isMultiDestination() ?
             ctx.multicastFlowControlSupplier().newInstance(udpChannel, streamId, registrationId) :
             ctx.unicastFlowControlSupplier().newInstance(udpChannel, streamId, registrationId);
@@ -2011,6 +2038,8 @@ public final class DriverConductor implements Agent
 
         final int termOffset = params.termOffset;
 
+        // 分配 RawLog（LogBuffer 文件）：在 aeronDir/publications/ 目录下创建内存映射文件
+        // 文件包含 3 个 Term Buffer（轮转写入）+ 1 个 Log Metadata Buffer
         final RawLog rawLog = newNetworkPublicationLog(
             isExclusive,
             params.sessionId,
@@ -2022,6 +2051,8 @@ public final class DriverConductor implements Agent
             termOffset,
             params,
             udpChannel.hasGroupSemantics());
+
+        // 以下 Counter 都分配在 CnC 文件的 counters 区域，Client 和 Driver 通过 mmap 共享访问
         UnsafeBufferPosition publisherPos = null;
         UnsafeBufferPosition publisherLmt = null;
         UnsafeBufferPosition senderPos = null;
@@ -2030,6 +2061,7 @@ public final class DriverConductor implements Agent
         AtomicCounter senderNaksReceived = null;
         try
         {
+            // publisherPos：发布者已写入的位置（Client offer() 时更新）
             publisherPos = PublisherPos.allocate(
                 tempBuffer,
                 countersManager,
@@ -2039,19 +2071,25 @@ public final class DriverConductor implements Agent
                 streamId,
                 channel,
                 isExclusive);
+            // publisherLimit：发布者可写入的最大位置（Driver 基于流控计算后更新，Client offer() 时读取检查）
             publisherLmt = PublisherLimit.allocate(
                 tempBuffer, countersManager, clientId, registrationId, params.sessionId, streamId, channel);
+            // senderPos：Sender 线程已发送到网络的位置
             senderPos = SenderPos.allocate(
                 tempBuffer, countersManager, clientId, registrationId, params.sessionId, streamId, channel);
+            // senderLimit：Sender 线程可发送的最大位置（由 FlowControl 根据接收端反馈计算）
             senderLmt = SenderLimit.allocate(
                 tempBuffer, countersManager, clientId, registrationId, params.sessionId, streamId, channel);
+            // senderBpe：背压事件计数（Sender 尝试发送但被流控限制时递增）
             senderBpe = SenderBpe.allocate(
                 tempBuffer, countersManager, clientId, registrationId, params.sessionId, streamId, channel);
+            // senderNaksReceived：收到的 NAK（否定确认）计数，用于触发重传
             senderNaksReceived = SenderNaksReceived.allocate(
                 tempBuffer, countersManager, clientId, registrationId, params.sessionId, streamId, channel);
 
             final AtomicCounter retransmitOverflowCounter = ctx.systemCounters().get(RETRANSMIT_OVERFLOW);
 
+            // 如果 Client 指定了起始位置，则初始化所有位置 Counter
             if (params.hasPosition)
             {
                 final int bits = LogBufferDescriptor.positionBitsToShift(params.termLength);
@@ -2062,6 +2100,7 @@ public final class DriverConductor implements Agent
                 senderLmt.setRelease(position);
             }
 
+            // RetransmitHandler：当收到接收端的 NAK 时负责调度重传
             final RetransmitHandler retransmitHandler = new RetransmitHandler(
                 ctx.senderCachedNanoClock(),
                 ctx.systemCounters().get(INVALID_PACKETS),
@@ -2071,6 +2110,7 @@ public final class DriverConductor implements Agent
                 params.maxResend,
                 retransmitOverflowCounter);
 
+            // 构造 NetworkPublication 对象，汇聚上述所有资源
             final NetworkPublication publication = new NetworkPublication(
                 registrationId,
                 ctx,
@@ -2092,21 +2132,34 @@ public final class DriverConductor implements Agent
                 networkPublicationThreadLocals,
                 isExclusive);
 
-            channelEndpoint.incRef();
-            networkPublications.add(publication);
-            senderProxy.newNetworkPublication(publication);
+            channelEndpoint.incRef();                      // endpoint 引用计数+1（共享 UDP Socket）
+            networkPublications.add(publication);           // 加入 Conductor 的 publication 列表
+            senderProxy.newNetworkPublication(publication); // 通知 Sender 线程：有新 Publication 需要发送
             activeSessionSet.add(new SessionKey(params.sessionId, streamId, canonicalForm));
 
             return publication;
         }
         catch (final Exception ex)
         {
+            // 创建失败时关闭已分配的资源，避免泄漏
             CloseHelper.quietCloseAll(
                 rawLog, publisherPos, publisherLmt, senderPos, senderLmt, senderBpe, senderNaksReceived);
             throw ex;
         }
     }
 
+    /**
+     * 【LogBuffer 文件创建点】为网络 Publication 分配 LogBuffer 文件并初始化元数据。
+     * <p>
+     * 创建链路：
+     * <pre>
+     *   logFactory.newPublication(registrationId, termLength, isSparse)
+     *     → FileStoreLogFactory.newInstance()
+     *       → new MappedRawLog(file, ...)  ← 在 {aeronDir}/publications/{registrationId}.logbuffer 创建文件并 mmap
+     * </pre>
+     * 创建完成后，Driver 在此文件上初始化 Log Metadata（sessionId、streamId、initialTermId、mtu 等），
+     * 然后通过 PUBLICATION_READY 响应将文件路径发送给 Client，Client 再做 mmap 映射实现共享。
+     */
     private RawLog newNetworkPublicationLog(
         final boolean isExclusive,
         final int sessionId,
@@ -2119,6 +2172,7 @@ public final class DriverConductor implements Agent
         final PublicationParams params,
         final boolean hasGroupSemantics)
     {
+        // ★ 这里是 LogBuffer 文件实际创建的地方：创建文件 → 设置大小 → mmap 映射
         final RawLog rawLog = logFactory.newPublication(registrationId, params.termLength, params.isSparse);
         final int receiverWindowLength = 0;
         final boolean tether = false;
@@ -2372,19 +2426,39 @@ public final class DriverConductor implements Agent
         return rawLog;
     }
 
+    /**
+     * 【UDP Socket 创建入口】获取或创建发送端的 ChannelEndpoint。
+     * <p>
+     * 同一个 UDP 地址（endpoint）复用同一个 SendChannelEndpoint（共享底层 DatagramChannel），
+     * 多个不同 streamId 的 Publication 可以复用同一个 endpoint 发送数据。
+     * <p>
+     * 当需要新建时的完整链路：
+     * <pre>
+     *   getOrCreateSendChannelEndpoint()
+     *     → ctx.sendChannelEndpointSupplier().newInstance()  ← 创建 SendChannelEndpoint 对象
+     *     → channelEndpoint.openChannel()                    ← 打开 UDP Socket
+     *       → openDatagramChannel()                          ← DatagramChannel.open() + bind()
+     *     → senderProxy.registerSendChannelEndpoint()        ← 注册到 Sender 线程的 Selector
+     *       → controlTransportPoller.registerForRead()       ← 用 NIO Selector 监听控制消息（NAK/SM）
+     * </pre>
+     */
     private SendChannelEndpoint getOrCreateSendChannelEndpoint(
         final PublicationParams params, final UdpChannel udpChannel, final long registrationId)
     {
+        // 先查找是否已有相同地址的 endpoint 可以复用
         SendChannelEndpoint channelEndpoint = findExistingSendChannelEndpoint(udpChannel);
         if (null == channelEndpoint)
         {
+            // 没有可复用的，需要新建 endpoint 和底层 UDP Socket
             AtomicCounter statusIndicator = null;
             AtomicCounter localSocketAddressIndicator = null;
             try
             {
+                // 分配通道状态计数器（Client 可通过该计数器监控通道健康度）
                 statusIndicator = SendChannelStatus.allocate(
                     tempBuffer, countersManager, registrationId, udpChannel.originalUriString());
 
+                // 创建 SendChannelEndpoint 对象（此时还没有打开 Socket）
                 channelEndpoint = ctx.sendChannelEndpointSupplier().newInstance(udpChannel, statusIndicator, ctx);
 
                 localSocketAddressIndicator = SendLocalSocketAddress.allocate(
@@ -2397,10 +2471,16 @@ public final class DriverConductor implements Agent
                 validateMtuForSndbuf(
                     params, channelEndpoint.socketSndbufLength(), ctx, udpChannel.originalUriString(), null);
 
+                // ★ 打开 UDP Socket：内部调用 DatagramChannel.open() + bind(bindAddress)
+                // 对于单播：bind 到本地端口（可能由 PortManager 自动分配临时端口）
+                // 对于多播：bind + join 多播组
                 channelEndpoint.openChannel();
                 channelEndpoint.indicateActive();
 
+                // 将 endpoint 注册到 Sender 线程的 ControlTransportPoller（NIO Selector），
+                // 用于监听来自接收端的控制消息（Status Message / NAK）
                 senderProxy.registerSendChannelEndpoint(channelEndpoint);
+                // 缓存 endpoint，后续相同地址的 Publication 可以复用
                 sendChannelEndpointByChannelMap.put(udpChannel.canonicalForm(), channelEndpoint);
             }
             catch (final Exception ex)
@@ -2638,12 +2718,28 @@ public final class DriverConductor implements Agent
         return position;
     }
 
+    /**
+     * 获取或创建 ReceiveChannelEndpoint —— 这是 UDP 端口监听的核心入口。
+     * <p>
+     * 同一 UDP 地址（如 localhost:40123）复用同一个 ReceiveChannelEndpoint（共享 DatagramChannel）。
+     * 多个 streamId 的 subscription 可以共享一个 endpoint，通过 DataPacketDispatcher 按 streamId 分发。
+     * <p>
+     * 当创建新 endpoint 时，完整流程：
+     * <ol>
+     *   <li>new ReceiveChannelEndpoint → 内部构造 UdpChannelTransport（持有 bindAddress）</li>
+     *   <li>openChannel() → openDatagramChannel()：创建 DatagramChannel 并 bind 到 UDP 端口</li>
+     *   <li>receiverProxy.registerReceiveChannelEndpoint() → Receiver 线程中注册到 NIO Selector</li>
+     * </ol>
+     * 之后 Receiver 线程在 doWork() 循环中通过 Selector 轮询该 DatagramChannel 收包。
+     */
     private ReceiveChannelEndpoint getOrCreateReceiveChannelEndpoint(
         final SubscriptionParams params, final UdpChannel udpChannel, final long registrationId)
     {
+        // 先查找是否已有同一 UDP 地址的 endpoint（复用）
         ReceiveChannelEndpoint channelEndpoint = findExistingReceiveChannelEndpoint(udpChannel);
         if (null == channelEndpoint)
         {
+            // ========== 新建 ReceiveChannelEndpoint ==========
             AtomicCounter channelStatus = null;
             AtomicCounter localSocketAddressIndicator = null;
             try
@@ -2651,8 +2747,13 @@ public final class DriverConductor implements Agent
                 final String channel = udpChannel.originalUriString();
                 channelStatus = ReceiveChannelStatus.allocate(tempBuffer, countersManager, registrationId, channel);
 
+                // ① 创建 DataPacketDispatcher：负责按 streamId+sessionId 将 UDP 数据包分发到对应的 PublicationImage
                 final DataPacketDispatcher dispatcher = new DataPacketDispatcher(
                     ctx.driverConductorProxy(), receiverProxy.receiver(), ctx.streamSessionLimit());
+
+                // ② 创建 ReceiveChannelEndpoint（继承自 UdpChannelTransport）
+                //    构造函数中传入 udpChannel.remoteData() 作为 bindAddress（即 "endpoint=localhost:40123" 解析出的地址）
+                //    此时 DatagramChannel 尚未创建
                 channelEndpoint = ctx.receiveChannelEndpointSupplier().newInstance(
                     udpChannel, dispatcher, channelStatus, ctx);
 
@@ -2666,9 +2767,18 @@ public final class DriverConductor implements Agent
 
                 validateInitialWindowForRcvBuf(params, channel, channelEndpoint.socketRcvbufLength(), ctx, null);
 
+                // ③ ★ 核心：打开 DatagramChannel 并绑定 UDP 端口 ★
+                //    openChannel() → openDatagramChannel()：
+                //      DatagramChannel.open() → channel.bind(bindAddress) → channel.configureBlocking(false)
+                //    绑定的地址就是 URI 中 endpoint 参数指定的 "localhost:40123"
                 channelEndpoint.openChannel();
                 channelEndpoint.indicateActive();
 
+                // ④ 将 endpoint 注册到 Receiver 线程
+                //    Receiver.onRegisterReceiveChannelEndpoint()：
+                //      dataTransportPoller.registerForRead(endpoint)：
+                //        DatagramChannel.register(selector, OP_READ) ← 注册到 NIO Selector
+                //    之后 Receiver 线程的 doWork() 循环中 selector.selectNow() 即可轮询到达的 UDP 包
                 receiverProxy.registerReceiveChannelEndpoint(channelEndpoint);
                 receiveChannelEndpointByChannelMap.put(udpChannel.canonicalForm(), channelEndpoint);
             }

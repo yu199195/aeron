@@ -184,27 +184,29 @@ public final class Subscription extends SubscriptionFields implements AutoClosea
      */
     public int poll(final FragmentHandler fragmentHandler, final int fragmentLimit)
     {
-        final Image[] images = this.images;
-        final int length = images.length;
-        int fragmentsRead = 0;
+        final Image[] images = this.images;                             // volatile 读取当前 Image 数组快照（Driver 可能随时增删 Image）
+        final int length = images.length;                               // Image 数量（每个 Image 对应一个 Publisher session）
+        int fragmentsRead = 0;                                          // 本次 poll 累计已读取的 fragment 数
 
-        int startingIndex = roundRobinIndex++;
-        if (startingIndex >= length)
+        int startingIndex = roundRobinIndex++;                          // 取上次轮询的起始下标并自增（round-robin 保证多 Image 间公平）
+        if (startingIndex >= length)                                    // 若起始下标越界（Image 数组可能缩小过）
         {
-            roundRobinIndex = startingIndex = 0;
+            roundRobinIndex = startingIndex = 0;                        // 重置为 0，从头开始
         }
 
-        for (int i = startingIndex; i < length && fragmentsRead < fragmentLimit; i++)
+        for (int i = startingIndex; i < length && fragmentsRead < fragmentLimit; i++)   // 从 startingIndex 开始向后遍历每个 Image
         {
-            fragmentsRead += images[i].poll(fragmentHandler, fragmentLimit - fragmentsRead);
+            fragmentsRead += images[i].poll(                            // 委托 Image.poll 从该 Image 的 term buffer 中读取 fragment
+                fragmentHandler, fragmentLimit - fragmentsRead);        // 剩余可读配额 = fragmentLimit - 已读数量（避免超额读取）
         }
 
-        for (int i = 0; i < startingIndex && fragmentsRead < fragmentLimit; i++)
+        for (int i = 0; i < startingIndex && fragmentsRead < fragmentLimit; i++)        // 绕回：遍历 startingIndex 之前的 Image
         {
-            fragmentsRead += images[i].poll(fragmentHandler, fragmentLimit - fragmentsRead);
+            fragmentsRead += images[i].poll(                            // 同上：读取剩余配额内的 fragment
+                fragmentHandler, fragmentLimit - fragmentsRead);
         }
 
-        return fragmentsRead;
+        return fragmentsRead;                                           // 返回本次 poll 实际消费的 fragment 总数（0 表示无数据可读）
     }
 
     /**

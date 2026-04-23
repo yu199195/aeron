@@ -20,25 +20,38 @@ import org.agrona.concurrent.NanoClock;
 import org.agrona.concurrent.status.AtomicCounter;
 
 /**
- * Tracking and handling of retransmit request, NAKs, for senders, and receivers.
+ * 【源码解析】RetransmitHandler —— 发送端处理 NAK（否定确认）并执行重传的核心组件。
  * <p>
- * When configured for multicast, a max number of retransmits is permitted by
- * {@link Configuration#MAX_RESEND_DEFAULT}. Additional received NAKs will be ignored if this maximum is reached.
- * When configured for unicast, a single outstanding retransmit is permitted, and additional received NAKs
- * will be ignored iff they overlap the current retransmit - otherwise the previous retransmit is assumed to have
- * 'worked' and the new NAK will take its place.
+ * 当接收端检测到丢包（Term Buffer 中的空洞）时，会发送 NAK 帧到发送端。
+ * 发送端的 ControlTransportPoller 收到 NAK 后，经 SendChannelEndpoint → NetworkPublication.onNak()
+ * 最终调用本类的 onNak() 方法。
+ * <p>
+ * 调用链路：
+ * ControlTransportPoller.receive() → SendChannelEndpoint.onNakMessage()
+ *   → NetworkPublication.onNak() → RetransmitHandler.onNak()
+ *   → RetransmitSender.resend() → NetworkPublication.resend() → UDP 重传
+ * <p>
+ * 并发重传限制：
+ * - 单播模式：最多 1 个并发重传（新 NAK 若不重叠旧的则替换之）
+ * - 多播模式：最多 maxRetransmits 个并发重传（防止多个接收端 NAK 导致的重传风暴）
+ * <p>
+ * 重传动作状态机：
+ * INACTIVE → (收到 NAK) → DELAYED → (延迟到期) → resend() → LINGERING → (超时) → INACTIVE
+ *                         若 delay=0 则直接 resend() → LINGERING
+ * <p>
+ * LINGERING 状态：重传已发出，但短时间内忽略同一范围的重复 NAK（避免重复重传）。
  */
 public final class RetransmitHandler
 {
-    private final RetransmitAction[] retransmitActionPool;
+    private final RetransmitAction[] retransmitActionPool; // 重传动作池（单播 1 个，多播 maxRetransmits 个）
     private final NanoClock nanoClock;
-    private final FeedbackDelayGenerator delayGenerator;
-    private final FeedbackDelayGenerator lingerTimeoutGenerator;
+    private final FeedbackDelayGenerator delayGenerator;         // 重传延迟生成器（多播防风暴）
+    private final FeedbackDelayGenerator lingerTimeoutGenerator; // 重传后的 linger 超时
     private final AtomicCounter invalidPackets;
-    private final boolean hasGroupSemantics;
-    private final AtomicCounter retransmitOverflowCounter;
+    private final boolean hasGroupSemantics;                     // 是否多播/MDC 语义
+    private final AtomicCounter retransmitOverflowCounter;       // 重传池溢出计数
 
-    private int activeRetransmitCount = 0;
+    private int activeRetransmitCount = 0; // 当前活跃的重传动作数
 
     /**
      * Create a handler for the dealing with the reception of frame request a frame to be retransmitted.
@@ -77,15 +90,25 @@ public final class RetransmitHandler
     }
 
     /**
-     * Called on reception of a NAK to start retransmit handling.
+     * 【NAK 处理入口】收到接收端发来的 NAK 后调用，决定是否以及何时重传。
+     * <p>
+     * 处理流程：
+     * 1. 校验 NAK 参数合法性（offset 对齐、范围有效）
+     * 2. 通过 flowControl.maxRetransmissionLength() 限制重传长度（防止过大重传）
+     * 3. scanForAvailableRetransmit()：在重传池中查找可用槽位
+     *    - 若已有相同范围的重传在进行中 → 返回 null，忽略重复 NAK
+     *    - 单播：新 NAK 不重叠旧的 → 直接替换
+     *    - 多播：池满 → 溢出计数器递增，忽略
+     * 4. 若 delay == 0 → 立即重传（单播通常如此）
+     *    若 delay > 0 → 进入 DELAYED 状态，由 processTimeouts() 超时后重传（多播防风暴）
      *
-     * @param termId           from the NAK and the term id of the buffer to retransmit from.
-     * @param termOffset       from the NAK and the offset of the data to retransmit.
-     * @param length           of the missing data.
-     * @param termLength       of the term buffer.
-     * @param mtuLength        for the publication.
-     * @param flowControl      for the publication (to clamp the retransmission length).
-     * @param retransmitSender to call if an immediate retransmit is required.
+     * @param termId           NAK 指定的 term ID（要重传的数据在哪个 term）
+     * @param termOffset       NAK 指定的偏移（要重传的数据起始位置）
+     * @param length           NAK 指定的缺失长度
+     * @param termLength       term buffer 长度
+     * @param mtuLength        MTU 长度
+     * @param flowControl      流控策略（用于限制重传长度）
+     * @param retransmitSender 重传执行器（通常是 NetworkPublication）
      */
     public void onNak(
         final int termId,
@@ -98,7 +121,9 @@ public final class RetransmitHandler
     {
         if (!isInvalid(termOffset, termLength, length) && 0 != length)
         {
+            // 通过流控策略限制单次重传长度，防止一个 NAK 触发过大的重传
             final int retransmitLength = flowControl.maxRetransmissionLength(termOffset, length, termLength, mtuLength);
+            // 在池中查找可用的重传槽位（同时去重——忽略已在处理中的相同范围 NAK）
             final RetransmitAction action = scanForAvailableRetransmit(termId, termOffset, retransmitLength);
             if (null != action)
             {
@@ -109,11 +134,13 @@ public final class RetransmitHandler
                 final long delay = delayGenerator.generateDelayNs();
                 if (0 == delay)
                 {
+                    // 单播通常无延迟，立即重传
                     retransmitSender.resend(termId, termOffset, action.length);
                     action.linger(lingerTimeoutGenerator.generateDelayNs(), nanoClock.nanoTime());
                 }
                 else
                 {
+                    // 多播：延迟后重传（防止多个接收端 NAK 同一段数据导致的重传风暴）
                     action.delay(delay, nanoClock.nanoTime());
                 }
             }
@@ -139,10 +166,13 @@ public final class RetransmitHandler
     }
 
     /**
-     * Called to process any outstanding timeouts.
+     * 【超时处理】由 Sender 线程周期性调用，处理延迟中和 linger 中的重传动作。
+     * <p>
+     * - DELAYED 状态到期 → 执行 resend()，转入 LINGERING
+     * - LINGERING 状态到期 → 释放槽位，转入 INACTIVE（可接受新的 NAK）
      *
-     * @param nowNs            time in nanoseconds.
-     * @param retransmitSender to call on retransmissions.
+     * @param nowNs            当前时间
+     * @param retransmitSender 重传执行器
      */
     public void processTimeouts(final long nowNs, final RetransmitSender retransmitSender)
     {
@@ -152,11 +182,13 @@ public final class RetransmitHandler
             {
                 if (RetransmitAction.State.DELAYED == action.state && (action.expiryNs - nowNs < 0))
                 {
+                    // 延迟到期 → 执行重传
                     retransmitSender.resend(action.termId, action.termOffset, action.length);
                     action.linger(lingerTimeoutGenerator.generateDelayNs(), nanoClock.nanoTime());
                 }
                 else if (RetransmitAction.State.LINGERING == action.state && (action.expiryNs - nowNs < 0))
                 {
+                    // Linger 到期 → 释放槽位（此范围可接受新 NAK）
                     removeRetransmit(action);
                 }
             }
@@ -264,14 +296,20 @@ public final class RetransmitHandler
         action.cancel();
     }
 
+    /**
+     * 重传动作状态机：
+     * INACTIVE  → 收到 NAK → DELAYED(等待延迟)
+     * DELAYED   → 延迟到期 → resend() → LINGERING(忽略重复NAK)
+     * LINGERING → linger到期 → INACTIVE(释放槽位)
+     */
     static final class RetransmitAction
     {
         @SuppressWarnings("JavadocVariable")
         enum State
         {
-            DELAYED,
-            LINGERING,
-            INACTIVE
+            DELAYED,    // 等待延迟到期后重传（多播防 NAK 风暴）
+            LINGERING,  // 已重传，短时间内忽略同一范围的重复 NAK
+            INACTIVE    // 空闲，可接受新 NAK
         }
 
         long expiryNs;

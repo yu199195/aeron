@@ -112,14 +112,15 @@ public class FrameDescriptor
     public static final int PADDING_FRAME_TYPE = HeaderFlyweight.HDR_TYPE_PAD;
 
     /**
-     * Compute the maximum supported message length for a buffer of given termLength.
+     * 【计算最大消息长度】单条消息允许的最大字节数 = min(termLength/8, 16MB)。
+     * 超过此长度的消息会被 checkMaxMessageLength 拒绝。
      *
      * @param termLength of the log buffer.
      * @return the maximum supported length for a message.
      */
     public static int computeMaxMessageLength(final int termLength)
     {
-        return Math.min(termLength >> 3, MAX_MESSAGE_LENGTH);
+        return Math.min(termLength >> 3, MAX_MESSAGE_LENGTH);           // termLength/8 与 16MB 取较小值 → 单条消息的最大字节数
     }
 
     /**
@@ -303,7 +304,9 @@ public class FrameDescriptor
     }
 
     /**
-     * Write the length header for a frame in a memory ordered fashion.
+     * 【以 release 语义写入帧长度】这是帧写入的最后一步——将 frameLength 以 putIntRelease（store-release）
+     * 写入帧头的第一个 int 字段。消费者通过 volatile 读该字段判断帧是否可见（length > 0 且非负值表示可读）。
+     * 此操作相当于一个"发布屏障"：保证此前写入的帧头、payload 等数据对消费者可见。
      *
      * @param buffer      containing the frame.
      * @param termOffset  at which a frame begins.
@@ -311,17 +314,19 @@ public class FrameDescriptor
      */
     public static void frameLengthOrdered(final UnsafeBuffer buffer, final int termOffset, final int frameLength)
     {
-        int length = frameLength;
-        if (ByteOrder.nativeOrder() != LITTLE_ENDIAN)
+        int length = frameLength;                                       // 准备写入的帧长度值
+        if (ByteOrder.nativeOrder() != LITTLE_ENDIAN)                   // 若当前平台不是小端字节序
         {
-            length = Integer.reverseBytes(frameLength);
+            length = Integer.reverseBytes(frameLength);                 // 翻转字节序（Aeron 协议统一使用小端）
         }
 
-        buffer.putIntRelease(termOffset, length);
+        buffer.putIntRelease(termOffset, length);                       // 以 release 语义写入帧头偏移 0 处（即 frameLength 字段）
+                                                                        // 这是帧写入的最后一步：从负值翻为正值，标志帧完全可读（发布屏障）
     }
 
     /**
-     * Write the type field for a frame.
+     * 【写入帧类型】设置帧头中的 type 字段（如 DATA / PADDING / NAK / SM 等）。
+     * handleEndOfLog 中用它将填充帧标记为 PADDING_FRAME_TYPE，让消费者跳过 term 末尾空白区。
      *
      * @param buffer     containing the frame.
      * @param termOffset at which a frame begins.
@@ -329,11 +334,13 @@ public class FrameDescriptor
      */
     public static void frameType(final UnsafeBuffer buffer, final int termOffset, final int type)
     {
-        buffer.putShort(typeOffset(termOffset), (short)type, LITTLE_ENDIAN);
+        buffer.putShort(typeOffset(termOffset),                         // 在帧头的 type 字段偏移处（termOffset + 6）
+            (short)type, LITTLE_ENDIAN);                                // 以小端写入帧类型（如 DATA=0x0001, PADDING=0x0002, SM, NAK 等）
     }
 
     /**
-     * Write the flags field for a frame.
+     * 【写入帧标志位】设置帧头中的 flags 字段。分片写入时用于标记 BEGIN_FRAG_FLAG / END_FRAG_FLAG，
+     * 消费者据此判断是完整帧还是某条大消息的首片 / 中间片 / 尾片。
      *
      * @param buffer     containing the frame.
      * @param termOffset at which a frame begins.
@@ -341,7 +348,8 @@ public class FrameDescriptor
      */
     public static void frameFlags(final UnsafeBuffer buffer, final int termOffset, final byte flags)
     {
-        buffer.putByte(flagsOffset(termOffset), flags);
+        buffer.putByte(flagsOffset(termOffset), flags);                 // 在帧头的 flags 字段偏移处（termOffset + 5）写入标志位
+                                                                        // BEGIN_FRAG=0x80（消息首片）, END_FRAG=0x40（消息尾片）
     }
 
     /**

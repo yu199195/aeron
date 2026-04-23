@@ -102,13 +102,28 @@ final class RecordingWriter implements BlockHandler, AutoCloseable
     }
 
     /**
-     * {@inheritDoc}
+     * {@link io.aeron.Image#blockPoll} / {@link io.aeron.Subscription#blockPoll} 在扫出一段连续 term 字节后调用；
+     * 本方法把该块<strong>原样（或带可选校验增强）</strong>写入当前 segment 文件，并推进逻辑 position。
+     * <p>
+     * 参数与块语义（与 {@link io.aeron.logbuffer.BlockHandler} 一致）：
+     * <ul>
+     *     <li>{@code termBuffer}/{@code termOffset}/{@code length}：当前 term 内一块数据，含各 frame 头，
+     *         已由 {@link io.aeron.logbuffer.TermBlockScanner} 保证边界落在完整 frame 上。</li>
+     *     <li>{@code sessionId}/{@code termId}：块内首帧所属流会话与 term；落盘时若未启用 checksum 则不再单独使用，
+     *         数据已在 buffer 中。</li>
+     * </ul>
+     * <p>
+     * Padding frame：块可能仅为 padding；此时只保证头有效，实际写入长度按 {@link io.aeron.protocol.DataHeaderFlyweight#HEADER_LENGTH}，
+     * 但 {@code segmentOffset} 仍按本块完整 {@code length} 增加，与 stream position 一致。
+     * <p>
+     * {@link #position()} = {@code segmentBasePosition + segmentOffset}，供 {@link RecordingSession} 更新 {@link io.aeron.archive.status.RecordingPos}。
      */
     public void onBlock(
         final DirectBuffer termBuffer, final int termOffset, final int length, final int sessionId, final int termId)
     {
         try
         {
+            // 块首帧类型：padding 只落盘头长度（块内可能声明更大范围，Archive 与 TermBlockScanner 约定一致）
             final boolean isPaddingFrame = termBuffer.getShort(typeOffset(termOffset)) == PADDING_FRAME_TYPE;
             final int dataLength = isPaddingFrame ? HEADER_LENGTH : length;
             final ByteBuffer byteBuffer;
@@ -116,17 +131,20 @@ final class RecordingWriter implements BlockHandler, AutoCloseable
             final long startNs = nanoClock.nanoTime();
             if (null == checksum || isPaddingFrame)
             {
+                // 零拷贝视图：直接映射到底层 mmap 的 ByteBuffer，从 term 写入文件通道
                 byteBuffer = termBuffer.byteBuffer();
                 byteBuffer.limit(termOffset + dataLength).position(termOffset);
             }
             else
             {
+                // 拷贝到专用 buffer，逐帧计算校验并写回帧头后再写盘（避免改共享 term 映射）
                 checksumBuffer.putBytes(0, termBuffer, termOffset, dataLength);
                 computeChecksum(checksum, checksumBuffer, dataLength);
                 byteBuffer = checksumBuffer.byteBuffer();
                 byteBuffer.limit(dataLength).position(0);
             }
 
+            // 当前 segment 文件内偏移；续写同一 segment（可能跨多次 blockPoll）
             int fileOffset = segmentOffset;
             do
             {
@@ -136,6 +154,7 @@ final class RecordingWriter implements BlockHandler, AutoCloseable
 
             if (forceWrites)
             {
+                // fileSyncLevel：刷盘保证崩溃后可见性；forceMetadata 是否连元数据一起 fsync
                 recordingFileChannel.force(forceMetadata);
             }
 
@@ -143,9 +162,11 @@ final class RecordingWriter implements BlockHandler, AutoCloseable
             recorder.bytesWritten(dataLength);
             recorder.writeTimeNs(writeTimeNs);
 
+            // 逻辑 stream position 前进整块长度（含 padding 全长），与 Image subscriber position 推进一致
             segmentOffset += length;
             if (segmentOffset >= segmentLength)
             {
+                // 单文件达到 segmentLength：关旧文件、抬高 segmentBasePosition、开新 segment 文件
                 onFileRollOver();
             }
         }

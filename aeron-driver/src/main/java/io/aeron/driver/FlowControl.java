@@ -25,7 +25,22 @@ import org.agrona.concurrent.status.CountersManager;
 import java.net.InetSocketAddress;
 
 /**
- * Strategy for applying flow control to the {@link Sender} on each stream.
+ * 【源码解析】FlowControl —— 发送端流控策略接口。
+ * <p>
+ * 职责：根据接收端发来的 Status Message（SM），计算发送端可以发送数据的上限位置（senderLimit）。
+ * Sender 线程只在 senderPosition < senderLimit 时才从 Term Buffer 读取数据并发送 UDP。
+ * <p>
+ * 流控链路：
+ * 接收端 poll() → subscriberPosition 推进 → SM(consumptionPos + windowLength) → UDP → 发送端
+ * → FlowControl.onStatusMessage() → senderLimit 更新
+ * → NetworkPublication.updatePublisherPositionAndLimit() → positionLimit 更新
+ * → 应用线程 offer(): if (position < positionLimit) 才能写入
+ * <p>
+ * 内置实现：
+ * - UnicastFlowControl：单播，limit = max(limit, position + window)
+ * - MaxMulticastFlowControl：多播，取所有接收端的最大 limit
+ * - MinMulticastFlowControl：多播，取所有接收端的最小 limit（保守策略）
+ * - TaggedMulticastFlowControl：多播，仅追踪带特定 groupTag 的接收端
  */
 public interface FlowControl extends AutoCloseable
 {

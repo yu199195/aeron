@@ -119,6 +119,20 @@ final class ClientProxy
         transmit(ON_AVAILABLE_IMAGE, buffer, 0, imageReady.length());
     }
 
+    /**
+     * 通过 CnC to-clients BroadcastBuffer 向 Client 发送 PUBLICATION_READY 事件。
+     * Client 端的 awaitResponse() 循环会从 BroadcastReceiver 中读取此消息，
+     * 然后用 logFileName 做 mmap 映射来构造 ConcurrentPublication。
+     *
+     * @param correlationId        Client 命令的 correlationId，用于匹配请求-响应
+     * @param registrationId       Publication 的注册 ID（首次创建时的 correlationId）
+     * @param streamId             流 ID
+     * @param sessionId            会话 ID（唯一标识一个 Publication 实例）
+     * @param logFileName          LogBuffer 文件的绝对路径，Client 会 mmap 此文件来写数据
+     * @param positionCounterId    publisherLimit 计数器 ID，Client 用于流控检查
+     * @param channelStatusCounterId 通道状态计数器 ID
+     * @param isExclusive          是否独占 Publication
+     */
     void onPublicationReady(
         final long correlationId,
         final long registrationId,
@@ -129,6 +143,7 @@ final class ClientProxy
         final int channelStatusCounterId,
         final boolean isExclusive)
     {
+        // 通过 Flyweight 直接在 buffer 上编码响应消息（零拷贝）
         publicationReady
             .correlationId(correlationId)
             .registrationId(registrationId)
@@ -138,7 +153,11 @@ final class ClientProxy
             .channelStatusCounterId(channelStatusCounterId)
             .logFileName(logFileName);
 
+        // 根据是否 exclusive 选择消息类型，Client 端据此调用不同的回调
+        // ON_PUBLICATION_READY → onNewPublication()（构造 ConcurrentPublication）
+        // ON_EXCLUSIVE_PUBLICATION_READY → onNewExclusivePublication()（构造 ExclusivePublication）
         final int msgTypeId = isExclusive ? ON_EXCLUSIVE_PUBLICATION_READY : ON_PUBLICATION_READY;
+        // 写入 to-clients BroadcastBuffer，所有连接的 Client 都可以收到（one-to-many broadcast）
         transmit(msgTypeId, buffer, 0, publicationReady.length());
     }
 

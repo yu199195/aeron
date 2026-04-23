@@ -72,7 +72,8 @@ public class ArchiveCreator
             .dirDeleteOnStart(true);
 
         final Archive.Context archiveContext = new Archive.Context()
-            .catalogCapacity(CATALOG_CAPACITY)
+            .catalogCapacity(CATALOG_CAPACITY).controlChannelEnabled(false)
+                .replicationChannel("aeron:udp?endpoint=localhost:0")
             .segmentFileLength(SEGMENT_LENGTH)
             .deleteArchiveOnStart(true)
             .archiveDir(archiveDir)

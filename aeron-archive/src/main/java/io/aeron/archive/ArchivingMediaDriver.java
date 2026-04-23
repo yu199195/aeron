@@ -71,6 +71,17 @@ public class ArchivingMediaDriver implements AutoCloseable
 
     /**
      * Launch a new {@link ArchivingMediaDriver} with provided contexts.
+     * <p>
+     * 启动流程：
+     * <ol>
+     *     <li><b>MediaDriver.launch(driverCtx)</b>：创建 CnC 文件、Conductor/Receiver/Sender 三大 Agent，
+     *     按 threadingMode 启动线程或 Invoker；返回嵌入式 MediaDriver。</li>
+     *     <li><b>errorCounter / errorHandler</b>：优先用 archiveCtx 的，否则基于 driver 的 countersValuesBuffer
+     *     创建 AtomicCounter，或用 driverCtx 的 errorHandler。</li>
+     *     <li><b>Archive.launch(archiveCtx...)</b>：将 driver.sharedAgentInvoker()、aeronDirectoryName、
+     *     errorHandler、errorCounter 注入 archiveCtx；Archive 与 MediaDriver 共享同一 CnC 目录和错误处理，
+     *     嵌入模式下可共享 AgentInvoker（需 archiveCtx.threadingMode(INVOKER)）。</li>
+     * </ol>
      *
      * @param driverCtx  for configuring the {@link MediaDriver}.
      * @param archiveCtx for configuring the {@link Archive}.
@@ -82,14 +93,17 @@ public class ArchivingMediaDriver implements AutoCloseable
         Archive archive = null;
         try
         {
+            // 1. 启动 MediaDriver：目录初始化、CnC 映射、Agent 线程启动
             driver = MediaDriver.launch(driverCtx);
 
+            // 2. 错误计数与处理：与 CnC 共享或复用 driver 的 errorHandler
             final int errorCounterId = SystemCounterDescriptor.ERRORS.id();
             final AtomicCounter errorCounter = null != archiveCtx.errorCounter() ?
                 archiveCtx.errorCounter() : new AtomicCounter(driverCtx.countersValuesBuffer(), errorCounterId);
             final ErrorHandler errorHandler = null != archiveCtx.errorHandler() ?
                 archiveCtx.errorHandler() : driverCtx.errorHandler();
 
+            // 3. 启动 Archive：共享 AgentInvoker（同线程驱动）、aeron 目录、错误处理
             archive = Archive.launch(archiveCtx
                 .mediaDriverAgentInvoker(driver.sharedAgentInvoker())
                 .aeronDirectoryName(driverCtx.aeronDirectoryName())

@@ -55,18 +55,29 @@ import static java.nio.file.StandardOpenOption.READ;
 import static org.agrona.BitUtil.align;
 
 /**
- * A replay session with a client which works through the required request response flow and streaming of recorded data.
- * The {@link ArchiveConductor} will initiate a session on receiving a ReplayRequest
- * (see {@link io.aeron.archive.codecs.ReplayRequestDecoder}).
+ * Archive 侧「回放会话」：在 {@link ArchiveConductor} 收到 Replay/BoundedReplay 等请求后创建，按状态机驱动。
  * <p>
- * The session will:
+ * <b>与 UDP 的关系（本类不直接发 UDP）</b>：回放数据通过 {@link ExclusivePublication#offerBlock} /
+ * {@link ExclusivePublication#appendPadding} 写入该 publication 对应的<strong>日志缓冲区（term buffer）</strong>。
+ * 运行在独立进程或同进程内的 <strong>Media Driver</strong> 中，{@link io.aeron.driver.Sender} 线程在
+ * {@link io.aeron.driver.Sender#doWork()} 里轮询每个 {@link io.aeron.driver.NetworkPublication}，调用
+ * {@link io.aeron.driver.NetworkPublication#send(long)}，从与本 {@link ExclusivePublication} 映射的同一
+ * {@link io.aeron.driver.buffer.RawLog} term 中读出帧，再经 {@link io.aeron.driver.media.SendChannelEndpoint#send(java.nio.ByteBuffer)}
+ * → {@link java.nio.channels.DatagramChannel} 进入内核 UDP。
+ * <p>
+ * 因此「磁盘 → 网络」：本类读 segment、改帧头、{@code offerBlock} → Sender → NetworkPublication → SendChannelEndpoint → UDP。
+ *
+ * @see io.aeron.driver.Sender
+ * @see io.aeron.driver.NetworkPublication
+ * @see io.aeron.driver.media.SendChannelEndpoint
+ * <p>
+ * 会话阶段（英文要点保留）：
  * <ul>
- * <li>Validate request parameters and respond with appropriate error if unable to replay.</li>
- * <li>Wait for replay publication to connect to the subscriber. If no subscriber appears within
- * {@link Archive.Configuration#CONNECT_TIMEOUT_PROP_NAME} the session will terminate and respond with an error.</li>
- * <li>Once the replay publication is connected an OK response to control client will be sent.</li>
- * <li>Stream recorded data into the publication {@link ExclusivePublication}.</li>
- * <li>If the replay is aborted part way through, send a ReplayAborted message and terminate.</li>
+ * <li>校验参数；segment 就绪且 {@link Publication#isConnected()} 后再进入 REPLAY。</li>
+ * <li>连接超时见 {@link Archive.Configuration#CONNECT_TIMEOUT_PROP_NAME}。</li>
+ * <li>连接建立后通过 control session 异步发送 OK（含 replaySessionId）。</li>
+ * <li>在 REPLAY 状态从录制文件按 term 读取 DATA 帧，写入 {@link ExclusivePublication}。</li>
+ * <li>中止时进入 INACTIVE/DONE，必要时 {@link ExclusivePublication#revoke()}。</li>
  * </ul>
  */
 class ReplaySession implements Session, AutoCloseable
@@ -199,7 +210,8 @@ class ReplaySession implements Session, AutoCloseable
     }
 
     /**
-     * {@inheritDoc}
+     * Archive 代理线程每轮调用：INIT 阶段打开 segment、等订阅方连上 publication；REPLAY 阶段读盘并 offer 到 publication。
+     * INACTIVE 时关文件并转入 DONE。
      */
     public int doWork()
     {
@@ -213,11 +225,13 @@ class ReplaySession implements Session, AutoCloseable
 
         try
         {
+            // 等待 segment 文件出现、校验起始帧、发 OK；直到 publication 已连接才切到 REPLAY。
             if (State.INIT == state)
             {
                 workCount += init();
             }
 
+            // 从录制文件读入 replayBuffer，修补帧头后经 publication 交给 Driver，最终由 Driver 按 channel 发 UDP（若 channel 为 udp）。
             if (State.REPLAY == state)
             {
                 workCount += replay();
@@ -293,6 +307,10 @@ class ReplaySession implements Session, AutoCloseable
         // Hook for Agent logging
     }
 
+    /**
+     * INIT：打开当前 segment、校验 replay 起点是否与录制时 stream/term 一致；先发控制面 OK，再阻塞直到
+     * {@link Publication#isConnected()}（表示至少有一个 Image/订阅方与本次 replay publication 匹配），避免无人接收仍往 term 里写。
+     */
     private int init() throws IOException
     {
         if (null == fileChannel)
@@ -308,6 +326,7 @@ class ReplaySession implements Session, AutoCloseable
             }
             else
             {
+                // 将全局 replayPosition 映射到 segment 内字节偏移与 term 内 offset，与录制时 log 布局一致。
                 final long startTermBasePosition = startPosition - (startPosition & (termLength - 1));
                 final int segmentOffset = (int)((replayPosition - startTermBasePosition) & (segmentLength - 1));
                 final int termId = LogBufferDescriptor.computeTermIdFromPosition(
@@ -320,6 +339,7 @@ class ReplaySession implements Session, AutoCloseable
 
                 if (replayPosition > startPosition && replayPosition != stopPosition)
                 {
+                    // 读首个数据帧头，确认 termOffset/termId/streamId 与推导一致，避免从半截帧开始回放。
                     if (notHeaderAligned(fileChannel, replayBuffer, segmentOffset, termOffset, termId, streamId))
                     {
                         raiseError("replayPosition=" + framePosition(0) + " does not point to a valid frame", null);
@@ -327,10 +347,12 @@ class ReplaySession implements Session, AutoCloseable
                     }
                 }
 
+                // 控制通道异步回复：客户端拿到 replaySessionId 后可在数据面订阅 replayChannel/replayStreamId。
                 controlSession.asyncSendOkResponse(correlationId, sessionId);
             }
         }
 
+        // 无订阅方则 publication 未连接；超时失败，避免 Driver 侧无发送目标。
         if (!publication.isConnected())
         {
             if (epochClock.time() > connectDeadlineMs)
@@ -347,6 +369,13 @@ class ReplaySession implements Session, AutoCloseable
         return 1;
     }
 
+    /**
+     * REPLAY：从 segment 文件读出与录制时相同布局的帧流，把 DATA 帧批量写入 {@link ExclusivePublication}。
+     * <p>
+     * 网络路径：{@code offerBlock} / {@code appendPadding} 只把数据放入本 publication 的 term；之后由 Media Driver
+     * 的发送路径（若 channel 为 UDP）把帧发到订阅方。录制时的 sessionId/streamId 与当前 publication 不同，故必须在
+     * 缓冲区内覆写帧头中的 sessionId、streamId，否则接收端无法按新 subscription 解析。
+     */
     @SuppressWarnings("methodlength")
     private int replay() throws IOException
     {
@@ -363,29 +392,34 @@ class ReplaySession implements Session, AutoCloseable
             return 0;
         }
 
+        // 有界回放：依赖 limit counter 扩展 stopPosition；未扩展则先等待。
         if (null != limitPosition && replayPosition >= stopPosition && notExtended(replayPosition, stopPosition))
         {
             return 0;
         }
 
+        // 当前 term 写满后推进到下一 term，必要时换下一个 segment 文件。
         if (termOffset == termLength)
         {
             nextTerm();
         }
 
         int workCount = 0;
+        // publication 背压：窗口为 0 时不读盘，避免大块缓冲无法 offer。
         if (publication.availableWindow() > 0)
         {
             final long startNs = nanoClock.nanoTime();
             final int bytesRead = readRecording(stopPosition - replayPosition);
             if (bytesRead > 0)
             {
+                // 使用「当前 replay publication」的 session/stream，替换录制文件里旧值，供接收端 Image 过滤。
                 final int sessionId = publication.sessionId();
                 final int streamId = publication.streamId();
                 final int remaining = (int)Math.min(replayLimit - replayPosition, LogBufferDescriptor.TERM_MAX_LENGTH);
                 int batchOffset = 0;
                 int paddingFrameLength = 0;
 
+                // 按帧遍历本批读入的字节：连续 DATA 帧合并一次 offerBlock；遇 PAD 则单独 appendPadding。
                 while (batchOffset < bytesRead && batchOffset < remaining)
                 {
                     final int frameLength = frameLength(replayBuffer, batchOffset);
@@ -399,6 +433,7 @@ class ReplaySession implements Session, AutoCloseable
 
                     if (HDR_TYPE_DATA == frameType)
                     {
+                        // 帧跨 read 边界则留到下一轮，保证 offer 的是完整帧序列。
                         if (batchOffset + alignedLength > bytesRead)
                         {
                             break;
@@ -426,6 +461,7 @@ class ReplaySession implements Session, AutoCloseable
 
                 if (batchOffset > 0)
                 {
+                    // 整块拷贝进 publication term；返回 position > 0 表示已提交，Driver 随后可发送（含 UDP）。
                     final long position = publication.offerBlock(replayBuffer, 0, batchOffset);
                     if (hasPublicationAdvanced(position, batchOffset))
                     {
@@ -439,6 +475,7 @@ class ReplaySession implements Session, AutoCloseable
 
                 if (paddingFrameLength > 0)
                 {
+                    // PAD 无 payload，用 appendPadding 占满对齐长度，保持 term 布局与流控语义。
                     final long position = publication.appendPadding(paddingFrameLength - HEADER_LENGTH);
                     if (hasPublicationAdvanced(position, align(paddingFrameLength, FRAME_ALIGNMENT)))
                     {
@@ -461,6 +498,7 @@ class ReplaySession implements Session, AutoCloseable
             ", frameOffset=" + frameOffset + ")";
     }
 
+    /** offerBlock/appendPadding 返回值 &gt;0 表示 term 位置前进；据此维护 replayPosition 与 term 内偏移。 */
     private boolean hasPublicationAdvanced(final long position, final int alignedLength)
     {
         if (position > 0)
@@ -498,6 +536,10 @@ class ReplaySession implements Session, AutoCloseable
         }
     }
 
+    /**
+     * 从当前 segment 文件的 {@code termBaseSegmentOffset + termOffset} 起，最多读满本 term 剩余或 buffer 容量。
+     * 读入的是录制时的原始 log 帧（含 data header），尚未经过 publication 发送。
+     */
     private int readRecording(final long availableReplay) throws IOException
     {
         final int limit = min((int)min(availableReplay, replayBuffer.capacity()), termLength - termOffset);
@@ -567,6 +609,7 @@ class ReplaySession implements Session, AutoCloseable
         return true;
     }
 
+    /** 当前 term 已满：segment 内推进 term；若跨 segment 则关闭当前文件并打开下一段 segment。 */
     private void nextTerm() throws IOException
     {
         termOffset = 0;
@@ -588,6 +631,7 @@ class ReplaySession implements Session, AutoCloseable
         segmentFile = null;
     }
 
+    /** 按 recordingId + segment 起始 position 打开磁盘上的录制 segment（只读 mmap/文件通道）。 */
     private void openRecordingSegment() throws IOException
     {
         if (null == segmentFile)

@@ -229,17 +229,37 @@ class RecordingSession implements Session
         return 1;
     }
 
+    /**
+     * 录制态下每轮 {@link ArchiveConductor.Recorder#doWork()} 调用一次：从 {@link Image} 的 term buffer
+     * 批量取出「连续完整 frame」组成的块，交给 {@link RecordingWriter}（实现 {@link io.aeron.logbuffer.BlockHandler}）落盘。
+     * <p>
+     * <b>{@link Image#blockPoll(io.aeron.logbuffer.BlockHandler, int)} 原理概要}</b>（实现见 aeron-client {@code Image.java}）：
+     * <ol>
+     *     <li>用 {@link Image} 的 subscriber position 定位当前 term 内偏移，计算本次最多扫描上界
+     *         {@code min(offset + blockLengthLimit, term 末尾)}；{@code blockLengthLimit} 在构造时为
+     *         {@code min(termBufferLength, ctx.fileIoMaxLength())}，避免单次 I/O 过大。</li>
+     *     <li>{@link io.aeron.logbuffer.TermBlockScanner#scan} 从 offset 起顺序读各 frame 的 length，
+     *         只拼接<strong>完整 frame</strong>；遇 padding frame 或半帧超出 limit 则停止，保证回调拿到的是合法块。</li>
+     *     <li>若有可读字节：调用 {@code handler.onBlock(termBuffer, offset, length, sessionId, termId)}，
+     *         此处 handler 即 {@link RecordingWriter#onBlock}，将块写入 segment 文件；最后在 {@code finally} 里
+     *         把 subscriber position 前进 {@code length}，与逐条 {@link Image#poll} 一样参与流控。</li>
+     *     <li>返回值为本轮消费的<strong>字节数</strong>（非条数）；0 表示当前没有新数据或 Image 已关闭。</li>
+     * </ol>
+     */
     private int record()
     {
         try
         {
+            // blockPoll：TermBlockScanner 扫描 term buffer → RecordingWriter.onBlock 写盘 → 推进 subscriber position
             final int workCount = image.blockPoll(recordingWriter, blockLengthLimit);
             if (workCount > 0)
             {
+                // RecordingPos 计数器：与 catalog / 客户端查询的「已录制位置」对齐（writer 内维护 stream position）
                 this.position.setRelease(recordingWriter.position());
             }
             else if (image.isEndOfStream() || image.isClosed())
             {
+                // 无新数据且流结束或 Image 关闭：结束录制会话，doWork 后续将进入 INACTIVE → STOPPED
                 state(
                     State.INACTIVE,
                     "image.isEndOfStream=" + image.isEndOfStream() + ", image.isClosed=" + image.isClosed());

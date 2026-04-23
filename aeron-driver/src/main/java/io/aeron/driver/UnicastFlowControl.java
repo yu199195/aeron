@@ -26,20 +26,39 @@ import java.net.InetSocketAddress;
 import static io.aeron.logbuffer.LogBufferDescriptor.computePosition;
 
 /**
- * Default unicast sender flow control strategy.
+ * 【源码解析】UnicastFlowControl —— 单播模式下的发送端流控策略。
  * <p>
- * Max of right edges.
- * No tracking of receivers.
+ * 原理：接收端周期性发送 Status Message（SM），包含 consumptionPosition 和 receiverWindowLength。
+ * 本流控策略根据 SM 计算 senderLimit = consumptionPosition + receiverWindowLength，
+ * 发送端只在 senderPosition < senderLimit 时才发数据。
+ * <p>
+ * 公式：senderLimit = max(当前senderLimit, consumptionPosition + receiverWindowLength)
+ * - 取 max 是因为 SM 可能乱序到达，不应让 limit 倒退
+ * - consumptionPosition：接收端已消费到的位置
+ * - receiverWindowLength：接收端愿意接受的窗口大小（由 CongestionControl 决定）
+ * <p>
+ * 单播特点：
+ * - 不追踪接收端身份（hasRequiredReceivers 始终返回 true）
+ * - onIdle 时保持 senderLimit 不变（不做超时收缩）
  */
 public class UnicastFlowControl implements FlowControl
 {
     /**
-     * Multiple of receiver window to allow for a retransmit action.
+     * 重传窗口倍数：maxRetransmissionLength = receiverWindowLength × retransmitReceiverWindowMultiple
      */
     private int retransmitReceiverWindowMultiple;
 
     /**
-     * {@inheritDoc}
+     * 【核心方法】处理接收端发来的 Status Message，计算新的 senderLimit。
+     * <p>
+     * SM 包含：consumptionTermId + consumptionTermOffset（接收端消费到的位置）
+     *          + receiverWindowLength（接收端愿意接收的窗口大小）
+     * <p>
+     * 计算：position = computePosition(consumptionTermId, consumptionTermOffset, ...)
+     * 新 limit = max(当前 senderLimit, position + receiverWindowLength)
+     * <p>
+     * 这个 limit 最终传导到：
+     * senderLimit → NetworkPublication.senderLimit → positionLimit → 应用 offer() 背压
      */
     public long onStatusMessage(
         final StatusMessageFlyweight flyweight,
@@ -49,12 +68,14 @@ public class UnicastFlowControl implements FlowControl
         final int positionBitsToShift,
         final long timeNs)
     {
+        // 从 SM 中提取接收端的消费位置（绝对 position）
         final long position = computePosition(
             flyweight.consumptionTermId(),
             flyweight.consumptionTermOffset(),
             positionBitsToShift,
             initialTermId);
 
+        // 新 limit = 消费位置 + 接收窗口；取 max 防止 SM 乱序导致 limit 倒退
         return Math.max(senderLimit, position + flyweight.receiverWindowLength());
     }
 

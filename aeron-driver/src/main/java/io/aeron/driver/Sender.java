@@ -83,6 +83,10 @@ class SenderRhsPadding extends SenderHotFields
  * - 通过 cache line padding 避免 false sharing，确保极致性能
  *
  * 线程模型：在 DEDICATED 模式下独占一个线程；Conductor 通过 SenderProxy 命令队列向 Sender 发送指令。
+ * <p>
+ * 【数据从哪来】每个 {@link NetworkPublication} 对应一块与客户端 {@code Publication}（含 Archive 回放的
+ * {@code ExclusivePublication}）共享的 {@code RawLog} term；应用或 Archive {@code offer} 的帧即落在此 buffer，
+ * 由本 Agent 的 {@link #doSend(long)} 轮询 {@link NetworkPublication#send(long)} 读出并走 UDP 发送路径。
  */
 public final class Sender extends SenderRhsPadding implements Agent
 {

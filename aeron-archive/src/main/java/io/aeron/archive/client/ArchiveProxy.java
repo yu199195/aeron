@@ -104,6 +104,7 @@ public final class ArchiveProxy
         new StopRecordingSubscriptionRequestEncoder();
     private final StopRecordingByIdentityRequestEncoder stopRecordingByIdentityRequest =
         new StopRecordingByIdentityRequestEncoder();
+    /** 标准回放请求的 SBE 编码器（复用实例）。先写入 {@link #buffer}，再经 {@link #offer(int)} 发到控制面 {@link #publication}。 */
     private final ReplayRequestEncoder replayRequest = new ReplayRequestEncoder();
     private final StopReplayRequestEncoder stopReplayRequest = new StopReplayRequestEncoder();
     private final ListRecordingsRequestEncoder listRecordingsRequest = new ListRecordingsRequestEncoder();
@@ -122,6 +123,7 @@ public final class ArchiveProxy
         new FindLastMatchingRecordingRequestEncoder();
     private final ListRecordingSubscriptionsRequestEncoder listRecordingSubscriptionsRequest =
         new ListRecordingSubscriptionsRequestEncoder();
+    /** 带位置计数器上界的回放请求编码器（多 {@code limitCounterId}）；发送路径与 {@link #replayRequest} 相同。 */
     private final BoundedReplayRequestEncoder boundedReplayRequest = new BoundedReplayRequestEncoder();
     private final StopAllReplaysRequestEncoder stopAllReplaysRequest = new StopAllReplaysRequestEncoder();
     private final ReplicateRequest2Encoder replicateRequest = new ReplicateRequest2Encoder();
@@ -497,17 +499,23 @@ public final class ArchiveProxy
     }
 
     /**
-     * Replay a recording from a given position. Supports specifying {@link ReplayParams} to change the behaviour of the
-     * replay. For example a bounded replay can be requested by specifying the boundingLimitCounterId. The ReplayParams
-     * is free to be reused after this call completes.
+     * 按 {@link ReplayParams} 发起回放（可配置有界回放等）。调用完成后可继续复用同一 {@link ReplayParams} 实例。
+     * <p>
+     * 本方法只负责在 {@link #publication} 上<b>编码并 offer</b> 控制消息，<b>不阻塞等待</b> Archive 响应。
+     * 典型调用方如 {@link AeronArchive#startReplay(long, String, int, ReplayParams)} 会再调
+     * {@link AeronArchive#pollForResponse(long)} 取回放会话 id 等结果。
+     * <p>
+     * 分支：若 {@link ReplayParams#isBounded()} 为真则走 {@link #boundedReplay(long, long, long, int, String, int,
+     * long, long)}（内部再调私有 10 参数重载）；否则走私有 {@code replay(...)}，并从 params 带上
+     * {@code fileIoMaxLength}、{@code replayToken}。
      *
-     * @param recordingId      to be replayed.
-     * @param replayChannel    to which the replay should be sent.
-     * @param replayStreamId   to which the replay should be sent.
-     * @param replayParams     optional parameters change the behaviour of the replay.
-     * @param correlationId    for this request.
-     * @param controlSessionId for this request.
-     * @return {@code true} if successfully offered otherwise {@code false}.
+     * @param recordingId      要回放的录制 id
+     * @param replayChannel    回放数据发往的 channel URI
+     * @param replayStreamId   回放 stream id
+     * @param replayParams     回放参数（起点、长度、是否 bounded 等）
+     * @param correlationId    本请求关联 id，用于匹配响应
+     * @param controlSessionId 控制会话 id（connect 握手得到）
+     * @return 成功写入 publication 返回 {@code true}，背压重试耗尽返回 {@code false}
      * @see ReplayParams
      */
     public boolean replay(
@@ -534,6 +542,7 @@ public final class ArchiveProxy
         }
         else
         {
+            // 普通 ReplayRequest：起点、长度、token、单次 IO 上限等均来自 ReplayParams。
             return replay(
                 recordingId,
                 replayParams.position(),
@@ -548,16 +557,21 @@ public final class ArchiveProxy
     }
 
     /**
-     * Replay a recording from a given position.
+     * 从指定逻辑位置开始回放录制。
+     * <p>
+     * 便捷重载：{@code fileIoMaxLength}、{@code replayToken} 固定为 {@link Aeron#NULL_VALUE}（由 Archive 端按协议默认处理），
+     * 实际转发到私有方法 {@link #replay(long, long, long, String, int, long, long, int, long)}。
+     * <p>
+     * {@link AeronArchive#startReplay(long, long, long, String, int)} 通常走此重载。
      *
-     * @param recordingId      to be replayed.
-     * @param position         from which the replay should be started.
-     * @param length           of the stream to be replayed. Use {@link Long#MAX_VALUE} to follow a live stream.
-     * @param replayChannel    to which the replay should be sent.
-     * @param replayStreamId   to which the replay should be sent.
-     * @param correlationId    for this request.
-     * @param controlSessionId for this request.
-     * @return {@code true} if successfully offered otherwise {@code false}.
+     * @param recordingId      录制 id
+     * @param position         回放起始 position，{@link AeronArchive#NULL_POSITION} 表示从录制头开始
+     * @param length           回放字节长度；{@link Long#MAX_VALUE} 常用于跟随或尽量多读
+     * @param replayChannel    回放发往的 channel
+     * @param replayStreamId   回放 stream id
+     * @param correlationId    请求关联 id
+     * @param controlSessionId 控制会话 id
+     * @return offer 成功为 {@code true}，否则 {@code false}
      */
     public boolean replay(
         final long recordingId,
@@ -581,17 +595,23 @@ public final class ArchiveProxy
     }
 
     /**
-     * Replay a recording from a given position bounded by a position counter.
+     * 有界回放：除 position/length 外，还用 {@code limitCounterId} 指向的计数器上界约束可回放范围。
+     * <p>
+     * 编码的是 {@link BoundedReplayRequestEncoder}（不是 {@link ReplayRequestEncoder}）。服务端
+     * {@link io.aeron.archive.ControlSessionAdapter} 按 {@link io.aeron.archive.codecs.BoundedReplayRequestDecoder}
+     * 解析后调用 {@link io.aeron.archive.ControlSession#onStartBoundedReplay}。
+     * <p>
+     * 本重载将 {@code fileIoMaxLength}、{@code replayToken} 置为 {@link Aeron#NULL_VALUE}，再调私有 10 参数重载。
      *
-     * @param recordingId      to be replayed.
-     * @param position         from which the replay should be started.
-     * @param length           of the stream to be replayed. Use {@link Long#MAX_VALUE} to follow a live stream.
-     * @param limitCounterId   to use as the replay bound.
-     * @param replayChannel    to which the replay should be sent.
-     * @param replayStreamId   to which the replay should be sent.
-     * @param correlationId    for this request.
-     * @param controlSessionId for this request.
-     * @return {@code true} if successfully offered otherwise {@code false}.
+     * @param recordingId      录制 id
+     * @param position         回放起点 position
+     * @param length           回放长度
+     * @param limitCounterId   作为上界的 Aeron 计数器 id
+     * @param replayChannel    回放 channel
+     * @param replayStreamId   回放 stream id
+     * @param correlationId    关联 id
+     * @param controlSessionId 控制会话 id
+     * @return offer 是否成功
      */
     public boolean boundedReplay(
         final long recordingId,
@@ -617,12 +637,12 @@ public final class ArchiveProxy
     }
 
     /**
-     * Stop an existing replay session.
+     * 停止指定回放会话（编码 {@link StopReplayRequestEncoder} 并发往控制面）。
      *
-     * @param replaySessionId  that should be stopped.
-     * @param correlationId    for this request.
-     * @param controlSessionId for this request.
-     * @return {@code true} if successfully offered otherwise {@code false}.
+     * @param replaySessionId  要停止的回放会话 id（通常由 startReplay 响应得到）
+     * @param correlationId    本请求关联 id
+     * @param controlSessionId 控制会话 id
+     * @return offer 是否成功
      */
     public boolean stopReplay(final long replaySessionId, final long correlationId, final long controlSessionId)
     {
@@ -636,12 +656,12 @@ public final class ArchiveProxy
     }
 
     /**
-     * Stop any existing replay sessions for recording id or all replay sessions regardless of recording id.
+     * 按录制 id 停止相关回放，或停止全部回放（语义由协议与 Archive 版本定义，见 {@link StopAllReplaysRequestEncoder}）。
      *
-     * @param recordingId      that should be stopped.
-     * @param correlationId    for this request.
-     * @param controlSessionId for this request.
-     * @return {@code true} if successfully offered otherwise {@code false}.
+     * @param recordingId      录制 id（或协议约定的哨兵值）
+     * @param correlationId    关联 id
+     * @param controlSessionId 控制会话 id
+     * @return offer 是否成功
      */
     public boolean stopAllReplays(final long recordingId, final long correlationId, final long controlSessionId)
     {
@@ -1419,13 +1439,12 @@ public final class ArchiveProxy
     }
 
     /**
-     * Request a token for this session that will allow a replay to be initiated from another image without
-     * re-authentication.
+     * 请求回放令牌：便于在另一 Image 上发起回放时免重复鉴权（与 {@link #replay} 的 {@code replayToken} 配合使用）。
      *
-     * @param lastCorrelationId for the request
-     * @param controlSessionId  for the request
-     * @param recordingId       that will be replayed.
-     * @return true if successfully offered
+     * @param lastCorrelationId 请求关联 id
+     * @param controlSessionId  控制会话 id
+     * @param recordingId       将要回放的录制 id
+     * @return offer 是否成功
      */
     public boolean requestReplayToken(final long lastCorrelationId, final long controlSessionId, final long recordingId)
     {
@@ -1463,6 +1482,17 @@ public final class ArchiveProxy
         return offer(updateChannelRequestEncoder.encodedLength());
     }
 
+    /**
+     * 将 {@link #buffer} 中已编码的控制消息（含消息头）offer 到 Archive 控制 {@link #publication}。
+     * <p>
+     * 所有请求（含 replay）均在 {@code wrapAndApplyHeader} 写好的变长体之前，再拼
+     * {@link MessageHeaderEncoder#ENCODED_LENGTH} 字节消息头；本方法一次 offer 的长度为「头 + length」。
+     * 遇背压时按 {@link #retryIdleStrategy} 与 {@link #retryAttempts} 重试；背压耗尽返回 {@code false} 不抛异常。
+     * 若 publication 已关闭、未连接或超过 max position，则抛 {@link ArchiveException}。
+     *
+     * @param length 消息头之后 SBE 体的字节数，例如 {@link ReplayRequestEncoder#encodedLength()}
+     * @return 整帧成功写入返回 {@code true}
+     */
     private boolean offer(final int length)
     {
         retryIdleStrategy.reset();
@@ -1470,6 +1500,7 @@ public final class ArchiveProxy
         int attempts = retryAttempts;
         while (true)
         {
+            // 消息头 + SBE 正文：Driver 作为一帧发到 Archive 订阅端（控制通道 UDP）。
             final long position = publication.offer(buffer, 0, MessageHeaderEncoder.ENCODED_LENGTH + length);
             if (position > 0)
             {
@@ -1539,6 +1570,20 @@ public final class ArchiveProxy
         }
     }
 
+    /**
+     * 在 {@link #buffer} 中组装 {@link ReplayRequestEncoder} 并 offer 到控制 publication（客户端侧最后一步）。
+     * <p>
+     * 服务端链路概要：{@link io.aeron.archive.ControlSessionAdapter} 识别
+     * {@link io.aeron.archive.codecs.ReplayRequestDecoder#TEMPLATE_ID} →
+     * {@link io.aeron.archive.ControlSession#onStartReplay} → {@link io.aeron.archive.ArchiveConductor#startReplay}
+     * → 创建 {@link io.aeron.archive.ReplaySession}，按 {@code replayChannel}/{@code replayStreamId} 向对端发回放数据。
+     * <p>
+     * {@code correlationId} 须与调用方随后在 {@link AeronArchive#pollForResponse(long)} 里等待的 id 一致；
+     * {@code controlSessionId} 来自与 Archive connect 握手。
+     *
+     * @param fileIoMaxLength {@link Aeron#NULL_VALUE} 表示默认；否则限制单次读盘块大小（协议版本相关）
+     * @param replayToken     {@link Aeron#NULL_VALUE} 表示未使用；可用于跨 Image 免重复鉴权等场景
+     */
     private boolean replay(
         final long recordingId,
         final long position,
@@ -1550,6 +1595,7 @@ public final class ArchiveProxy
         final int fileIoMaxLength,
         final long replayToken)
     {
+        // 先在 buffer 首部写 MessageHeader，再写 ReplayRequest 定长域与 replayChannel 变长字符串。
         replayRequest
             .wrapAndApplyHeader(buffer, 0, messageHeader)
             .controlSessionId(controlSessionId)
@@ -1565,6 +1611,11 @@ public final class ArchiveProxy
         return offer(replayRequest.encodedLength());
     }
 
+    /**
+     * 与 {@link #replay} 类似，但编码 {@link BoundedReplayRequestEncoder}，并携带 {@code limitCounterId}。
+     * 服务端解码 {@link io.aeron.archive.codecs.BoundedReplayRequestDecoder} 后进入
+     * {@link io.aeron.archive.ControlSession#onStartBoundedReplay}。
+     */
     private boolean boundedReplay(
         final long recordingId,
         final long position,
@@ -1577,6 +1628,7 @@ public final class ArchiveProxy
         final int fileIoMaxLength,
         final long replayToken)
     {
+        // 与私有 replay 相同：MessageHeader + BoundedReplayRequest（多 limitCounterId 字段）。
         boundedReplayRequest
             .wrapAndApplyHeader(buffer, 0, messageHeader)
             .controlSessionId(controlSessionId)

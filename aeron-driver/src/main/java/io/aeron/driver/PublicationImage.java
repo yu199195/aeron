@@ -111,7 +111,35 @@ class PublicationImagePadding3 extends PublicationImageReceiverFields
 }
 
 /**
- * State maintained for active sessionIds within a channel for receiver processing.
+ * 【源码解析】PublicationImage —— 接收端的"流镜像"，Aeron 可靠接收的核心组件。
+ * <p>
+ * 一个 PublicationImage 对应一个远端 NetworkPublication 的本地接收副本。
+ * 它维护接收端的 Term Buffer（与发送端结构相同），并驱动以下可靠性机制：
+ * <p>
+ * 1. 【数据插入】Receiver 线程收到 UDP 数据帧 → insertPacket() → TermRebuilder.insert()
+ *    将数据写入本地 Term Buffer，推进 hwmPosition（高水位线）
+ * <p>
+ * 2. 【丢包检测与 NAK】Conductor 线程调用 trackRebuild()：
+ *    - LossDetector.scan() 扫描 rebuildPosition 到 hwmPosition 之间的空洞
+ *    - 空洞超时 → onGapDetected() → 将 NAK 信息写入 loss* 字段
+ *    - Receiver 线程 processPendingLoss() → 通过 channelEndpoint.sendNakMessage() 发送 NAK
+ * <p>
+ * 3. 【Status Message 发送】Conductor 线程 trackRebuild() 中根据拥塞控制计算 receiverWindowLength，
+ *    调用 scheduleStatusMessage() → Receiver 线程 sendPendingStatusMessage() → 发送 SM
+ *    SM 中的 consumptionPosition + receiverWindowLength 反馈给发送端，驱动端到端流控
+ * <p>
+ * 4. 【拥塞控制】CongestionControl.onTrackRebuild() 根据当前接收状态动态调整 receiverWindowLength
+ * <p>
+ * 5. 【RTT 测量】CongestionControl.shouldMeasureRtt() → 发送 RTTM 帧 → 收到回复后计算 RTT
+ * <p>
+ * 线程模型（跨线程协调使用 VarHandle 实现无锁通信）：
+ * - Conductor 线程：trackRebuild()（丢包检测 + 拥塞控制 + 调度 SM/NAK）
+ * - Receiver 线程：insertPacket()（插入数据）、sendPendingStatusMessage()、processPendingLoss()
+ * <p>
+ * 关键 Position：
+ * - hwmPosition：收到的最高数据位置（可能有空洞）
+ * - rebuildPosition：已连续重建（无空洞）到的位置
+ * - subscriberPositions[]：各订阅者已消费到的位置
  */
 public final class PublicationImage
     extends PublicationImagePadding3
@@ -120,7 +148,11 @@ public final class PublicationImage
     @SuppressWarnings("JavadocVariable")
     enum State
     {
-        INIT, ACTIVE, DRAINING, LINGER, DONE
+        INIT,      // 初始化，等待接收数据
+        ACTIVE,    // 正常接收中
+        DRAINING,  // 流结束，等待所有数据被消费
+        LINGER,    // 数据消费完毕，短暂保留
+        DONE       // 完全关闭，可回收
     }
 
     // expected minimum number of SMs with EOS bit set sent during draining.
@@ -417,9 +449,18 @@ public final class PublicationImage
     }
 
     /**
-     * Called from the {@link LossDetector} when gap is detected by the {@link DriverConductor} thread.
+     * 【LossHandler 回调】Conductor 线程中 LossDetector 检测到空洞超时后调用。
      * <p>
-     * {@inheritDoc}
+     * 将丢包信息写入 loss* 字段，供 Receiver 线程 processPendingLoss() 读取并发送 NAK。
+     * <p>
+     * 跨线程无锁协议（类似 SeqLock）：
+     * 1. beginLossChange++ (release)
+     * 2. storeStoreFence()
+     * 3. 写入 lossTermId / lossTermOffset / lossLength
+     * 4. endLossChange++ (release)
+     * <p>
+     * Receiver 线程读取时：先读 endLossChange → 读数据 → loadLoadFence → 读 beginLossChange，
+     * 两者相等则数据一致。
      */
     public void onGapDetected(final int termId, final int termOffset, final int length)
     {
@@ -554,6 +595,24 @@ public final class PublicationImage
         trackConnection(transportIndex, remoteAddress, cachedNanoClock.nanoTime());
     }
 
+    /**
+     * 【Conductor 线程调用的核心方法】跟踪接收端重建进度，驱动丢包检测和 SM 调度。
+     * <p>
+     * 完整流程：
+     * 1. 收集所有订阅者位置 → 计算 minSubscriberPosition（用于 SM 的 consumptionPosition）
+     * 2. LossDetector.scan()：在 rebuildPosition → hwmPosition 之间扫描空洞
+     *    → 发现空洞超时 → onGapDetected() → 记录 NAK 信息
+     * 3. 推进 rebuildPosition 到最新的无空洞位置
+     * 4. CongestionControl.onTrackRebuild()：计算新的 receiverWindowLength
+     * 5. 判断是否需要发送 SM：
+     *    - 拥塞控制强制发送
+     *    - 订阅者位置推进超过窗口 1/4（threshold）
+     *    - 窗口大小变化
+     *    满足条件 → scheduleStatusMessage() → Receiver 线程稍后发送
+     *
+     * @param nowNs 当前时间
+     * @return workCount
+     */
     int trackRebuild(final long nowNs)
     {
         int workCount = 0;
@@ -564,6 +623,7 @@ public final class PublicationImage
             long minSubscriberPosition = Long.MAX_VALUE;
             long maxSubscriberPosition = 0;
 
+            // 收集所有订阅者位置
             for (final ReadablePosition subscriberPosition : subscriberPositions)
             {
                 final long position = subscriberPosition.getVolatile();
@@ -571,7 +631,9 @@ public final class PublicationImage
                 maxSubscriberPosition = Math.max(maxSubscriberPosition, position);
             }
 
+            // 从最快订阅者位置开始扫描（避免重复扫描已消费区域）
             final long rebuildPosition = Math.max(this.rebuildPosition.get(), maxSubscriberPosition);
+            // 丢包检测：扫描 rebuildPosition → hwmPosition 之间的空洞
             final long scanOutcome = lossDetector.scan(
                 termBuffers[indexByPosition(rebuildPosition, positionBitsToShift)],
                 rebuildPosition,
@@ -581,10 +643,12 @@ public final class PublicationImage
                 positionBitsToShift,
                 initialTermId);
 
+            // 推进 rebuildPosition 到扫描结果（无空洞的连续位置）
             final int rebuildTermOffset = (int)(rebuildPosition & termLengthMask);
             final long newRebuildPosition = (rebuildPosition - rebuildTermOffset) + rebuildOffset(scanOutcome);
             this.rebuildPosition.proposeMaxRelease(newRebuildPosition);
 
+            // 拥塞控制：根据当前状态计算新的 receiverWindowLength
             final long ccOutcome = congestionControl.onTrackRebuild(
                 nowNs,
                 minSubscriberPosition,
@@ -595,14 +659,15 @@ public final class PublicationImage
                 lossFound(scanOutcome));
 
             final int windowLength = CongestionControl.receiverWindowLength(ccOutcome);
-            final int threshold = CongestionControl.threshold(windowLength);
+            final int threshold = CongestionControl.threshold(windowLength); // = windowLength / 4
 
-            if (CongestionControl.shouldForceStatusMessage(ccOutcome) ||
-                (minSubscriberPosition > (nextSmPosition + threshold)) ||
-                windowLength != nextSmReceiverWindowLength)
+            // 判断是否需要调度发送 SM
+            if (CongestionControl.shouldForceStatusMessage(ccOutcome) ||       // 拥塞控制强制
+                (minSubscriberPosition > (nextSmPosition + threshold)) ||       // 消费推进超过阈值
+                windowLength != nextSmReceiverWindowLength)                     // 窗口大小变化
             {
                 cleanBufferTo(minSubscriberPosition - (termLengthMask + 1));
-                scheduleStatusMessage(minSubscriberPosition, windowLength);
+                scheduleStatusMessage(minSubscriberPosition, windowLength);     // → Receiver 线程发送
                 workCount += 1;
             }
         }
@@ -611,15 +676,25 @@ public final class PublicationImage
     }
 
     /**
-     * Insert frame into term buffer from the {@link Receiver}.
+     * 【数据帧插入 - Receiver 线程】收到 UDP 数据帧后，将其写入本地 Term Buffer。
+     * <p>
+     * 处理逻辑：
+     * 1. 计算帧的绝对 position
+     * 2. 流控检查：isFlowControlOverRun（超过接收窗口上限）/ isFlowControlUnderRun（过于落后）
+     * 3. 心跳帧：不插入数据，仅更新时间戳和 hwmPosition
+     * 4. 数据帧：通过 TermRebuilder.insert() 写入 Term Buffer，推进 hwmPosition
+     * <p>
+     * TermRebuilder.insert() 是接收端的"两阶段提交"——
+     * 直接将收到的帧（含帧头和负载）写入 Term Buffer 的对应位置，
+     * 最后通过 frameLengthOrdered() 设置正值帧长度（release 语义），标记帧完成。
      *
-     * @param termId         for the data packet to insert into the appropriate term.
-     * @param termOffset     for the start of the packet in the term.
-     * @param buffer         for the data packet to insert into the appropriate term.
-     * @param length         of the data packet.
-     * @param transportIndex from which the packet came.
-     * @param srcAddress     from which the packet came.
-     * @return number of bytes applied as a result of this insertion.
+     * @param termId         数据帧所属的 term ID
+     * @param termOffset     数据帧在 term 中的偏移
+     * @param buffer         数据帧 buffer
+     * @param length         数据帧长度
+     * @param transportIndex 接收该帧的传输通道索引
+     * @param srcAddress     发送端地址
+     * @return 插入的字节数
      */
     int insertPacket(
         final int termId,
@@ -747,10 +822,21 @@ public final class PublicationImage
     }
 
     /**
-     * Called from the {@link Receiver} to send any pending Status Messages.
+     * 【SM 发送 - Receiver 线程】发送 Conductor 线程调度的 Status Message。
+     * <p>
+     * SM 包含：
+     * - consumptionTermId + consumptionTermOffset：最慢订阅者的消费位置（发送端据此回收 buffer）
+     * - receiverWindowLength：接收窗口大小（由 CongestionControl 计算）
+     * <p>
+     * 发送时机：
+     * - Conductor 调用 scheduleStatusMessage() 更新 nextSmPosition/nextSmReceiverWindowLength
+     *   （通过 SeqLock 无锁协议跨线程传递）
+     * - SM 周期超时（smTimeoutNs）
+     * <p>
+     * SM → 发送端 → FlowControl.onStatusMessage() → 更新 senderLimit → 控制发送速率
      *
-     * @param nowNs current time.
-     * @return number of work items processed.
+     * @param nowNs 当前时间
+     * @return workCount
      */
     int sendPendingStatusMessage(final long nowNs)
     {
@@ -812,9 +898,17 @@ public final class PublicationImage
     }
 
     /**
-     * Called from the {@link Receiver} thread to processing any pending loss of packets.
+     * 【NAK 发送 - Receiver 线程】处理 Conductor 线程检测到的丢包，发送 NAK 帧到发送端。
+     * <p>
+     * Conductor 线程在 onGapDetected() 中将丢包信息写入 loss* 字段（SeqLock 协议）。
+     * Receiver 线程在此方法中读取并发送 NAK：
+     * - 可靠模式（isReliable）：发送 NAK(termId, termOffset, length) → 发送端重传
+     * - 不可靠模式：用 PADDING 帧填充空洞（tryFillGap），跳过丢失的数据
+     * <p>
+     * NAK 帧格式：
+     * | frameLength | version | flags | type=NAK | sessionId | streamId | termId | termOffset | length |
      *
-     * @return number of work items processed.
+     * @return workCount
      */
     int processPendingLoss()
     {
@@ -838,13 +932,14 @@ public final class PublicationImage
             {
                 if (isReliable)
                 {
+                    // 可靠模式：发送 NAK → 发送端重传丢失的数据
                     channelEndpoint.sendNakMessage(imageConnections, sessionId, streamId, termId, termOffset, length);
-                    // FIXME: Increment only if sent successfully
                     nakMessagesSent.incrementRelease();
                     receiverNaksSent.incrementRelease();
                 }
                 else
                 {
+                    // 不可靠模式：用 PADDING 帧填充空洞，跳过丢失数据
                     final UnsafeBuffer termBuffer = termBuffers[indexByTerm(initialTermId, termId)];
                     if (tryFillGap(rawLog.metaData(), termBuffer, termId, termOffset, length))
                     {
@@ -862,10 +957,19 @@ public final class PublicationImage
     }
 
     /**
-     * Called from the {@link Receiver} thread to check for initiating an RTT measurement.
+     * 【RTT 测量发起 - Receiver 线程】由 CongestionControl 决定是否发起 RTT 测量。
+     * <p>
+     * StaticWindowCongestionControl 不测量 RTT（shouldMeasureRtt 返回 false）。
+     * CubicCongestionControl 会周期性发起 RTT 测量，用于动态调整窗口大小。
+     * <p>
+     * 测量流程：
+     * 1. 接收端发送 RTTM 帧（flags=REPLY_FLAG, echoTimestampNs=当前时间）
+     * 2. 发送端收到 → 回复 RTTM 帧（echoTimestampNs 原样返回）
+     * 3. 接收端收到回复 → rttNs = nowNs - echoTimestampNs - receptionDelta
+     * 4. congestionControl.onRttMeasurement(rttNs) → 用于窗口调整
      *
-     * @param nowNs in nanoseconds
-     * @return number of work items processed.
+     * @param nowNs 当前时间
+     * @return workCount
      */
     int initiateAnyRttMeasurements(final long nowNs)
     {

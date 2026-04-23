@@ -65,8 +65,30 @@ import static org.agrona.BitUtil.SIZE_OF_LONG;
 import static org.agrona.collections.Hashing.compoundKey;
 
 /**
- * Aggregator of multiple {@link NetworkPublication}s onto a single transport channel for the
- * sending of data and setup frames plus the receiving of status and NAK frames.
+ * 【源码解析】SendChannelEndpoint —— 发送端的 UDP 传输通道。
+ * <p>
+ * 职责：
+ * 1. 管理 UDP DatagramChannel 的生命周期（open / bind / close）
+ * 2. 聚合多个 NetworkPublication 到同一个传输通道（按 sessionId+streamId 路由）
+ * 3. 发送数据帧、SETUP 帧、心跳帧、RTT 响应帧
+ * 4. 接收并分发控制帧（SM、NAK、RTT、Error）到对应的 NetworkPublication
+ * <p>
+ * 线程模型：
+ * - 发送方法 send() 由 Sender 线程调用
+ * - 控制帧回调 onStatusMessage/onNakMessage/onRttMeasurement 由 Sender 线程中的
+ *   ControlTransportPoller.pollTransports() 触发
+ * <p>
+ * UDP 发送路径（零拷贝）：
+ * NetworkPublication.sendData() → sendBuffer(mmap ByteBuffer slice)
+ *   → SendChannelEndpoint.send(ByteBuffer) → DatagramChannel.write(ByteBuffer)
+ *   → 内核 UDP 协议栈 → 网卡
+ * <p>
+ * Archive 等场景下，回放侧事先 {@code offerBlock} 写入的帧与上述 {@code sendBuffer} 同源（同一 term mmap），
+ * 故本类 {@link #send(ByteBuffer)} 即为「用户态最后一跳」进入 UDP。
+ * <p>
+ * 多目的地（MDC）支持：
+ * - ManualSndMultiDestination：手动控制的多目的地
+ * - DynamicSndMultiDestination：根据 SM 自动发现的多目的地
  */
 public class SendChannelEndpoint extends UdpChannelTransport
 {
@@ -151,12 +173,24 @@ public class SendChannelEndpoint extends UdpChannelTransport
     }
 
     /**
-     * Open the underlying sockets for the channel.
+     * 【打开发送端 UDP Socket】
+     * 在 DriverConductor.getOrCreateSendChannelEndpoint() 中被调用。
+     * <p>
+     * 内部调用 UdpChannelTransport.openDatagramChannel()，该方法会：
+     * <pre>
+     *   1. DatagramChannel.open()      → 创建 UDP DatagramChannel
+     *   2. bind(bindAddress)            → 绑定本地地址和端口（单播）
+     *      或 bind + join multicast     → 绑定并加入多播组（多播）
+     *   3. configureBlocking(false)     → 设为非阻塞模式供 NIO Selector 使用
+     * </pre>
+     * 打开完成后，还会更新本地 Socket 地址计数器，供监控工具查看实际绑定的地址和端口。
      */
     public void openChannel()
     {
+        // 创建并 bind UDP DatagramChannel（详见 UdpChannelTransport.openDatagramChannel）
         openDatagramChannel(statusIndicator);
 
+        // 将实际绑定的本地地址（含 OS 分配的端口号）写入计数器，供外部监控
         LocalSocketAddressStatus.updateBindAddress(
             requireNonNull(localSocketAddressIndicator, "localSocketAddressIndicator not allocated"),
             bindAddressAndPort(),
@@ -242,11 +276,19 @@ public class SendChannelEndpoint extends UdpChannelTransport
     }
 
     /**
-     * Send contents of a {@link ByteBuffer} to connected address.
-     * This is used on the sender side for performance over send(ByteBuffer, SocketAddress).
+     * 【UDP 数据发送 - 单播/已连接模式】
+     * <p>
+     * 这是 Aeron 数据帧从用户空间到达内核 UDP 协议栈的最终一跳。
+     * <p>
+     * 关键性能设计：
+     * - 使用 DatagramChannel.write() 而非 send()（已连接模式，内核无需每次查路由表）
+     * - buffer 是 mmap Term Buffer 的 ByteBuffer slice，实现零拷贝
+     * - sendHook 提供调试/监控扩展点
+     * <p>
+     * 对于 MDC（多目的地）通道，委托给 MultiSndDestination.send() 向所有目的地发送。
      *
-     * @param buffer to send
-     * @return number of bytes sent
+     * @param buffer 要发送的数据（mmap ByteBuffer slice 或 heartbeat/setup buffer）
+     * @return 发送的字节数
      */
     public int send(final ByteBuffer buffer)
     {
@@ -263,12 +305,13 @@ public class SendChannelEndpoint extends UdpChannelTransport
 
             if (null == multiSndDestination)
             {
+                // 单目的地：使用 connected DatagramChannel.write()（性能最优）
                 try
                 {
                     sendHook(buffer, connectAddress);
                     if (sendDatagramChannel.isConnected())
                     {
-                        bytesSent = sendDatagramChannel.write(buffer);
+                        bytesSent = sendDatagramChannel.write(buffer); // → 内核 UDP 协议栈
                     }
                 }
                 catch (final PortUnreachableException ignore)
@@ -281,6 +324,7 @@ public class SendChannelEndpoint extends UdpChannelTransport
             }
             else
             {
+                // 多目的地（MDC）：向所有活跃目的地发送
                 bytesSent = multiSndDestination.send(sendDatagramChannel, buffer, this, bytesToSend);
             }
         }
@@ -348,13 +392,18 @@ public class SendChannelEndpoint extends UdpChannelTransport
     }
 
     /**
-     * Callback back handler for received status messages.
+     * 【控制帧分发 - Status Message】
+     * <p>
+     * 由 ControlTransportPoller.pollTransports() 解析 SM 帧后回调。
+     * 按 sessionId+streamId 查找对应的 NetworkPublication 并分发：
+     * - SEND_SETUP_FLAG：接收端请求重发 SETUP → triggerSendSetupFrame()
+     * - 正常 SM：更新流控 → NetworkPublication.onStatusMessage()
      *
-     * @param msg            flyweight over the status message.
-     * @param buffer         containing the message.
-     * @param length         of the message.
-     * @param srcAddress     of the message.
-     * @param conductorProxy to send messages back to the conductor.
+     * @param msg            SM 帧 flyweight
+     * @param buffer         包含 SM 帧的 buffer
+     * @param length         SM 帧长度
+     * @param srcAddress     发送 SM 的接收端地址
+     * @param conductorProxy Conductor 代理
      */
     public void onStatusMessage(
         final StatusMessageFlyweight msg,
@@ -370,7 +419,7 @@ public class SendChannelEndpoint extends UdpChannelTransport
 
         if (null != multiSndDestination)
         {
-            multiSndDestination.onStatusMessage(msg, srcAddress);
+            multiSndDestination.onStatusMessage(msg, srcAddress); // MDC：更新目的地活性
         }
 
         final NetworkPublication publication = publicationBySessionAndStreamId.get(compoundKey(sessionId, streamId));
@@ -378,11 +427,11 @@ public class SendChannelEndpoint extends UdpChannelTransport
         {
             if (SEND_SETUP_FLAG == (msg.flags() & SEND_SETUP_FLAG))
             {
-                publication.triggerSendSetupFrame(msg, srcAddress);
+                publication.triggerSendSetupFrame(msg, srcAddress); // 接收端请求 SETUP
             }
             else
             {
-                publication.onStatusMessage(msg, srcAddress, conductorProxy);
+                publication.onStatusMessage(msg, srcAddress, conductorProxy); // 流控更新
             }
         }
     }
@@ -420,12 +469,18 @@ public class SendChannelEndpoint extends UdpChannelTransport
     }
 
     /**
-     * Callback back handler for received NAK messages.
+     * 【控制帧分发 - NAK（否定确认）】
+     * <p>
+     * 接收端检测到丢包后发送 NAK 帧，包含：
+     * - termId + termOffset：缺失数据的起始位置
+     * - length：缺失数据的长度
+     * <p>
+     * 分发到对应 NetworkPublication.onNak() → RetransmitHandler → resend()
      *
-     * @param msg        flyweight over the NAK message.
-     * @param buffer     containing the message.
-     * @param length     of the message.
-     * @param srcAddress of the message.
+     * @param msg        NAK 帧 flyweight
+     * @param buffer     包含 NAK 帧的 buffer
+     * @param length     NAK 帧长度
+     * @param srcAddress 发送 NAK 的接收端地址
      */
     public void onNakMessage(
         final NakFlyweight msg,
@@ -438,7 +493,7 @@ public class SendChannelEndpoint extends UdpChannelTransport
 
         if (null != publication)
         {
-            publication.onNak(msg.termId(), msg.termOffset(), msg.length());
+            publication.onNak(msg.termId(), msg.termOffset(), msg.length()); // → 重传流程
             nakMessagesReceived.incrementRelease();
         }
     }

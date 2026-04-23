@@ -65,49 +65,166 @@ import static java.lang.Math.max;
 import static java.lang.Math.min;
 
 /**
- * Election process to determine a new cluster leader and catch up followers.
+ * 集群选举过程实现类：负责确定新的 Leader 并协调 Follower 追赶日志。
+ * <p>
+ * 这是 Aeron Cluster 实现 Raft 共识算法的核心组件，处理以下职责：
+ * <ul>
+ *   <li><b>Leader 选举</b>：通过 Canvass → Nominate → Ballot 流程选出新 Leader</li>
+ *   <li><b>日志复制</b>：Leader 发布日志，Follower 订阅并复制</li>
+ *   <li><b>状态追赶</b>：Follower 从 Leader 同步落后的日志</li>
+ *   <li><b>角色转换</b>：管理节点在 Follower/Candidate/Leader 之间的状态转换</li>
+ * </ul>
+ * <p>
+ * <b>选举状态机</b>：
+ * <pre>
+ *     INIT → CANVASS → NOMINATE → CANDIDATE_BALLOT → LEADER_READY
+ *                                ↘ FOLLOWER_BALLOT → FOLLOWER_READY
+ * </pre>
+ * <p>
+ * <b>触发条件</b>：
+ * <ul>
+ *   <li>节点启动时无 Leader</li>
+ *   <li>Leader 心跳超时 (leaderHeartbeatTimeoutNs)</li>
+ *   <li>集群成员变更</li>
+ * </ul>
+ *
+ * @see ElectionState
+ * @see ConsensusModuleAgent
  */
 class Election
 {
+    /** 集群所有成员数组（包括本节点） */
     private final ClusterMember[] clusterMembers;
+
+    /** 当前节点的 ClusterMember 对象 */
     private final ClusterMember thisMember;
+
+    /** 成员 ID 到 ClusterMember 的映射，用于快速查找 */
     private final Int2ObjectHashMap<ClusterMember> clusterMemberByIdMap;
+
+    /** 共识消息发布器，用于发送选举相关消息（RequestVote、Vote 等） */
     private final ConsensusPublisher consensusPublisher;
+
+    /** ConsensusModule 配置上下文 */
     private final ConsensusModule.Context ctx;
+
+    /** ConsensusModule 代理，用于回调状态变更 */
     private final ConsensusModuleAgent consensusModuleAgent;
+
+    /** 选举开始时的 leadership term ID（用于检测是否有新的 term） */
     private final long initialLogLeadershipTermId;
+
+    /** 选举开始时的最后更新时间（纳秒） */
     private final long initialTimeOfLastUpdateNs;
+
+    /** 选举开始时的 term 基准日志位置 */
     private final long initialTermBaseLogPosition;
+
+    /** 是否是节点启动触发的选举（true=启动选举，false=运行时选举） */
     private final boolean isNodeStartup;
+
+    /** 上次状态变更时间（纳秒），用于超时检测 */
     private long timeOfLastStateChangeNs;
+
+    /** 上次收到更新的时间（纳秒），用于心跳检测 */
     private long timeOfLastUpdateNs;
+
+    /** 上次提交位置更新的时间（纳秒） */
     private long timeOfLastCommitPositionUpdateNs;
+
+    /** 提名阶段的截止时间（纳秒） */
     private long nominationDeadlineNs;
+
+    /** 当前日志位置（已持久化的最高位置） */
     private long logPosition;
+
+    /** 追加位置（Leader 已写入但可能未提交的位置） */
     private long appendPosition;
+
+    /** 已通知给 Service 的提交位置 */
     private long notifiedCommitPosition;
+
+    /** 追赶时的加入位置（Follower 从此位置开始追赶） */
     private long catchupJoinPosition = NULL_POSITION;
+
+    /** 复制时的 leadership term ID */
     private long replicationLeadershipTermId = NULL_VALUE;
+
+    /** 复制停止位置（复制到此位置后停止） */
     private long replicationStopPosition = NULL_POSITION;
+
+    /** 复制截止时间（纳秒） */
     private long replicationDeadlineNs;
+
+    /** 复制时的 term 基准日志位置 */
     private long replicationTermBaseLogPosition;
+
+    /** Leader 的 recording ID（用于从 Archive 回放） */
     private long leaderRecordingId = NULL_VALUE;
+
+    /** 当前 leadership term ID */
     private long leadershipTermId;
+
+    /** 日志的 leadership term ID */
     private long logLeadershipTermId;
+
+    /** 候选人的 term ID（自我提名时递增） */
     private long candidateTermId;
+
+    /** 上次发布的提交位置（避免重复发送） */
     private long lastPublishedCommitPosition;
+
+    /** 上次发布的追加位置（避免重复发送） */
     private long lastPublishedAppendPosition;
+
+    /** 日志 session ID（用于订阅 Leader 的日志流） */
     private int logSessionId = NULL_SESSION_ID;
+
+    /** 优雅关闭的 Leader ID（如果 Leader 主动关闭，记录其 ID） */
     private int gracefulClosedLeaderId;
+
+    /** 是否是首次初始化（用于某些一次性逻辑） */
     private boolean isFirstInit = true;
+
+    /** 是否是 Leader 启动（新当选的 Leader） */
     private boolean isLeaderStartup;
+
+    /** 是否使用扩展拉票阶段（节点启动时为 true，给予更多时间） */
     private boolean isExtendedCanvass;
+
+    /** Leader 成员对象（null 表示当前无 Leader） */
     private ClusterMember leaderMember = null;
+
+    /** 当前选举状态 */
     private ElectionState state = INIT;
+
+    /** 日志订阅（Follower 用于订阅 Leader 的日志流） */
     private Subscription logSubscription = null;
+
+    /** 日志回放器（从 Archive 回放历史日志） */
     private LogReplay logReplay = null;
+
+    /** 日志复制器（从 Leader 复制日志到本地 Archive） */
     private RecordingReplication logReplication = null;
 
+    /**
+     * 构造 Election 实例，初始化选举过程。
+     * <p>
+     * 此构造函数在 {@link ConsensusModuleAgent} 需要启动选举时调用，初始化所有必要的状态。
+     *
+     * @param isNodeStartup           是否是节点启动触发的选举（true=首次启动，false=运行时 Leader 失效）
+     * @param gracefulClosedLeaderId  如果前任 Leader 优雅关闭，此为其 ID；否则为 NULL_VALUE
+     * @param leadershipTermId        当前 leadership term ID
+     * @param termBaseLogPosition     当前 term 的基准日志位置
+     * @param logPosition             当前已持久化的日志位置
+     * @param appendPosition          当前已追加的日志位置（可能未提交）
+     * @param clusterMembers          集群所有成员数组
+     * @param clusterMemberByIdMap    成员 ID 到 ClusterMember 的映射
+     * @param thisMember              当前节点的 ClusterMember 对象
+     * @param consensusPublisher      共识消息发布器
+     * @param ctx                     ConsensusModule 配置上下文
+     * @param consensusModuleAgent    ConsensusModule 代理
+     */
     Election(
         final boolean isNodeStartup,
         final int gracefulClosedLeaderId,
@@ -122,141 +239,430 @@ class Election
         final ConsensusModule.Context ctx,
         final ConsensusModuleAgent consensusModuleAgent)
     {
+        // 初始化选举类型（节点启动 vs 运行时选举）
         this.isNodeStartup = isNodeStartup;
-        this.isExtendedCanvass = isNodeStartup;
+        this.isExtendedCanvass = isNodeStartup;  // 节点启动时使用更长的拉票时间
         this.gracefulClosedLeaderId = gracefulClosedLeaderId;
+
+        // 初始化日志位置信息
         this.logPosition = logPosition;
         this.appendPosition = appendPosition;
         this.logLeadershipTermId = leadershipTermId;
         this.initialLogLeadershipTermId = leadershipTermId;
         this.initialTermBaseLogPosition = termBaseLogPosition;
+
+        // 初始化 term ID（候选人 term 从当前 term 开始）
         this.leadershipTermId = leadershipTermId;
         this.candidateTermId = leadershipTermId;
+
+        // 初始化集群成员信息
         this.clusterMembers = clusterMembers;
         this.clusterMemberByIdMap = clusterMemberByIdMap;
         this.thisMember = thisMember;
+
+        // 初始化通信与配置
         this.consensusPublisher = consensusPublisher;
         this.ctx = ctx;
         this.consensusModuleAgent = consensusModuleAgent;
 
+        // 初始化时间戳（设置为 1 天前，确保首次检查会触发）
         final long nowNs = nowNs(ctx);
         this.initialTimeOfLastUpdateNs = nowNs - TimeUnit.DAYS.toNanos(1);
         this.timeOfLastUpdateNs = initialTimeOfLastUpdateNs;
         this.timeOfLastCommitPositionUpdateNs = initialTimeOfLastUpdateNs;
 
+        // 验证必需参数并更新计数器
         Objects.requireNonNull(thisMember);
-        ctx.electionStateCounter().setRelease(INIT.code());
-        ctx.electionCounter().incrementRelease();
+        ctx.electionStateCounter().setRelease(INIT.code());  // 设置初始状态为 INIT
+        ctx.electionCounter().incrementRelease();             // 递增选举计数（用于监控）
     }
 
+    /**
+     * 获取当前的 Leader 成员。
+     *
+     * @return Leader 的 {@link ClusterMember} 对象；如果当前无 Leader 则返回 null
+     */
     ClusterMember leader()
     {
         return leaderMember;
     }
 
+    /**
+     * 获取日志流的 session ID。
+     * <p>
+     * Follower 使用此 session ID 订阅 Leader 的日志 publication。
+     *
+     * @return 日志流的 session ID
+     */
     int logSessionId()
     {
         return logSessionId;
     }
 
+    /**
+     * 获取当前的 leadership term ID。
+     * <p>
+     * Leadership term ID 在每次成功选举后递增，用于标识不同的领导任期。
+     *
+     * @return 当前 leadership term ID
+     */
     long leadershipTermId()
     {
         return leadershipTermId;
     }
 
+    /**
+     * 获取当前的日志位置。
+     * <p>
+     * 表示本节点已持久化到 Archive 的最高日志位置。
+     *
+     * @return 当前日志位置（字节偏移）
+     */
     long logPosition()
     {
         return logPosition;
     }
 
+    /**
+     * 判断是否是 Leader 启动状态。
+     * <p>
+     * 当节点刚当选为 Leader 时此标志为 true，用于触发 Leader 初始化逻辑。
+     *
+     * @return true 如果是 Leader 启动阶段
+     */
     boolean isLeaderStartup()
     {
         return isLeaderStartup;
     }
 
+    /**
+     * 获取当前节点的成员 ID。
+     *
+     * @return 当前节点的成员 ID
+     */
     int thisMemberId()
     {
         return thisMember.id();
     }
 
+    /**
+     * 执行选举状态机的一次工作循环。
+     * <p>
+     * 这是选举过程的核心驱动方法，根据当前状态 ({@link ElectionState}) 调用相应的处理方法。
+     * 每次调用处理当前状态的逻辑，可能会触发状态转换。
+     * <p>
+     * <b>状态处理流程</b>：
+     * <ul>
+     *   <li><b>INIT</b>：初始化选举，进入 CANVASS 状态</li>
+     *   <li><b>CANVASS</b>：向所有成员发送 CanvassPosition，收集日志位置信息</li>
+     *   <li><b>NOMINATE</b>：根据日志完整性决定自我提名或等待他人提名</li>
+     *   <li><b>CANDIDATE_BALLOT</b>：发送 RequestVote，等待多数派投票</li>
+     *   <li><b>FOLLOWER_BALLOT</b>：处理来自候选人的投票请求，投票给合适的候选人</li>
+     *   <li><b>LEADER_*</b>：Leader 各阶段（初始化、日志复制、回放、就绪）</li>
+     *   <li><b>FOLLOWER_*</b>：Follower 各阶段（追赶、日志复制、回放、就绪）</li>
+     * </ul>
+     * <p>
+     * 此方法被 {@link ConsensusModuleAgent#doWork()} 周期性调用。
+     *
+     * @param nowNs 当前时间（纳秒），用于超时检测
+     * @return 本次循环执行的工作量（用于 idle strategy 判断）
+     */
+    /**
+     * Election 的主工作循环：根据当前选举状态执行对应的逻辑。
+     * <p>
+     * 这是一个<b>状态机</b>，每次调用都会根据 {@code state} 执行对应的处理函数。
+     * 状态机保证了选举流程的有序推进：
+     * <ul>
+     *   <li><b>选举路径</b>：INIT → CANVASS → NOMINATE → BALLOT → READY</li>
+     *   <li><b>Leader 路径</b>：CANDIDATE_BALLOT → LEADER_LOG_REPLICATION → LEADER_REPLAY → LEADER_INIT → LEADER_READY</li>
+     *   <li><b>Follower 路径</b>：FOLLOWER_BALLOT → FOLLOWER_LOG_REPLICATION → FOLLOWER_REPLAY → (追赶) → FOLLOWER_READY</li>
+     * </ul>
+     * <p>
+     * <b>调用频率</b>：每次 ConsensusModuleAgent.doWork() 都会调用（约 1000 次/秒）
+     * <p>
+     * <b>工作量统计</b>：
+     * <ul>
+     *   <li>workCount == 0: 无事可做（idle），ConsensusModuleAgent 会执行 idle 策略</li>
+     *   <li>workCount > 0: 有工作完成（发送消息、接收响应、状态转换等），保持高效率</li>
+     * </ul>
+     * <p>
+     * <b>状态分类</b>（18 个状态）：
+     * <ul>
+     *   <li><b>1. 选举阶段</b>（5 个状态）：INIT, CANVASS, NOMINATE, CANDIDATE_BALLOT, FOLLOWER_BALLOT</li>
+     *   <li><b>2. Leader 阶段</b>（4 个状态）：LEADER_LOG_REPLICATION, LEADER_REPLAY, LEADER_INIT, LEADER_READY</li>
+     *   <li><b>3. Follower 阶段</b>（8 个状态）：FOLLOWER_LOG_REPLICATION, FOLLOWER_REPLAY, FOLLOWER_CATCHUP_INIT,
+     *       FOLLOWER_CATCHUP_AWAIT, FOLLOWER_CATCHUP, FOLLOWER_LOG_INIT, FOLLOWER_LOG_AWAIT, FOLLOWER_READY</li>
+     *   <li><b>4. 终止阶段</b>（1 个状态）：CLOSED</li>
+     * </ul>
+     *
+     * @param nowNs 当前集群时间（纳秒），用于超时判断和时间戳生成
+     * @return 本次执行的工作量（0 表示无事可做，>0 表示有工作完成）
+     * @see ConsensusModuleAgent#doWork() 主循环中调用此方法
+     * @see ElectionState 所有选举状态的定义
+     */
     int doWork(final long nowNs)
     {
+        // ==================== 工作量计数器 ====================
+        // workCount 用于记录本次执行的工作量：
+        // - 0: 无事可做（idle）
+        // - >0: 有工作完成（发送消息、接收响应、状态转换等）
+        // ConsensusModuleAgent 根据 workCount 决定是否执行 idle 策略
         int workCount = 0;
+
+        // ==================== 状态机核心：根据当前状态执行对应逻辑 ====================
+        // 选举状态机有 18 个状态，分为 4 大类：
+        // 1. 选举阶段：INIT, CANVASS, NOMINATE, CANDIDATE_BALLOT, FOLLOWER_BALLOT
+        // 2. Leader 阶段：LEADER_LOG_REPLICATION, LEADER_REPLAY, LEADER_INIT, LEADER_READY
+        // 3. Follower 阶段：FOLLOWER_LOG_REPLICATION, FOLLOWER_REPLAY, FOLLOWER_CATCHUP_*, FOLLOWER_LOG_*, FOLLOWER_READY
+        // 4. 终止阶段：CLOSED
 
         switch (state)
         {
+            // ==================== 阶段 1: 选举初始化 ====================
             case INIT:
+                // 选举初始化：重置状态、设置超时、准备选举
+                // 职责：
+                // - 重置所有成员的投票状态
+                // - 设置选举超时时间
+                // - 生成新的 candidateTermId
+                // - 立即转换到 CANVASS 状态
                 workCount += init(nowNs);
                 break;
 
+            // ==================== 阶段 2: 询问阶段（Canvass） ====================
             case CANVASS:
+                // 询问阶段：向所有节点发送 CanvassPosition 请求，收集日志位置信息
+                // 职责：
+                // - 向所有成员发送 CanvassPosition 消息（询问日志位置）
+                // - 收集响应，判断自己的日志是否是最新的
+                // - 超时后转换到 NOMINATE 状态
+                //
+                // 为什么需要 Canvass？
+                // - 避免多次投票失败（预先知道谁的日志最新）
+                // - 减少网络开销（不需要多轮投票）
                 workCount += canvass(nowNs);
                 break;
 
+            // ==================== 阶段 3: 提名阶段（Nominate） ====================
             case NOMINATE:
+                // 提名阶段：决定是否参选
+                // 职责：
+                // - 比较所有节点的日志位置（使用 compareLog()）
+                // - 如果自己的日志最新，转换到 CANDIDATE_BALLOT（参选）
+                // - 否则转换到 FOLLOWER_BALLOT（跟随）
+                //
+                // 决策依据：compareLog(logLeadershipTermId, logPosition)
+                // 1. 先比较 leadershipTermId（term ID 越大越新）
+                // 2. 再比较 logPosition（日志位置越大越新）
                 workCount += nominate(nowNs);
                 break;
 
+            // ==================== 阶段 4a: 候选人投票阶段 ====================
             case CANDIDATE_BALLOT:
+                // 候选人投票阶段：作为候选人，向所有节点发送投票请求
+                // 职责：
+                // - 向所有成员发送 RequestVote 消息（请求投票）
+                // - 收集投票响应（Vote 消息）
+                // - 如果获得多数票（quorum），转换到 LEADER_LOG_REPLICATION
+                // - 如果超时未获得多数票，重新开始选举（回到 CANVASS）
+                //
+                // Quorum 计算：quorum = (clusterMembers.length / 2) + 1
+                // 示例：3 节点集群，quorum = 2（需要 2 票）
                 workCount += candidateBallot(nowNs);
                 break;
 
+            // ==================== 阶段 4b: 跟随者投票阶段 ====================
             case FOLLOWER_BALLOT:
+                // 跟随者投票阶段：作为跟随者，等待投票结果
+                // 职责：
+                // - 等待接收 NewLeadershipTerm 消息（新 Leader 通知）
+                // - 收到后转换到 FOLLOWER_LOG_REPLICATION
+                // - 超时后重新开始选举（回到 CANVASS）
+                //
+                // 注意：在 Nominate 阶段已经决定不参选
                 workCount += followerBallot(nowNs);
                 break;
 
+            // ==================== 阶段 5a: Leader 日志复制准备 ====================
             case LEADER_LOG_REPLICATION:
+                // Leader 日志复制阶段：启动日志 publication，等待 Followers 订阅
+                // 职责：
+                // - 创建日志 publication（供 Followers 订阅）
+                //   * channel: logChannel (UDP multicast)
+                //   * streamId: logStreamId
+                // - 开始 Archive 录制日志
+                // - 等待 Followers 连接并开始复制
+                // - 转换到 LEADER_REPLAY
+                //
+                // 关键操作：aeron.addExclusivePublication(logChannel, logStreamId)
                 workCount += leaderLogReplication(nowNs);
                 break;
 
+            // ==================== 阶段 6a: Leader 日志重放 ====================
             case LEADER_REPLAY:
+                // Leader 日志重放阶段：重放未提交的日志
+                // 职责：
+                // - 从上次提交位置（commitPosition）重放到当前位置（logPosition）
+                // - 确保 Leader 状态与日志一致
+                // - 调用 ClusteredService.onSessionMessage() 恢复业务状态
+                // - 转换到 LEADER_INIT
+                //
+                // 为什么需要重放？
+                // - Leader 可能在上次 term 中崩溃，导致部分日志未提交
+                // - 重放确保 Leader 的业务状态与日志一致
                 workCount += leaderReplay(nowNs);
                 break;
 
+            // ==================== 阶段 7a: Leader 初始化 ====================
             case LEADER_INIT:
+                // Leader 初始化阶段：准备接受客户端请求
+                // 职责：
+                // - 创建 NewLeadershipTerm 事件，写入日志
+                //   * leadershipTermId（新的 term ID）
+                //   * leaderMemberId（本节点 ID）
+                //   * logPosition（当前日志位置）
+                // - 通知所有 Followers 新的 leadership term
+                // - 转换到 LEADER_READY
+                //
+                // NewLeadershipTerm 的作用：
+                // - 标记新的 leadership term 开始
+                // - Followers 消费到此事件后知道新 Leader 已就绪
                 workCount += leaderInit(nowNs);
                 break;
 
+            // ==================== 阶段 8a: Leader 就绪 ====================
             case LEADER_READY:
+                // Leader 就绪阶段：等待所有 Followers 追赶到 leadershipTermId
+                // 职责：
+                // - 等待 quorum 的 Followers 追赶到 NewLeadershipTerm 位置
+                // - 持续发送心跳消息（CommitPosition）
+                // - 所有 Followers 就绪后，选举结束
+                // - 返回到 ConsensusModuleAgent，切换到 ACTIVE 状态
+                //
+                // 结束条件：readyFollowers >= quorumThreshold
                 workCount += leaderReady(nowNs);
                 break;
 
+            // ==================== 阶段 5b: Follower 日志复制准备 ====================
             case FOLLOWER_LOG_REPLICATION:
+                // Follower 日志复制阶段：订阅 Leader 的日志
+                // 职责：
+                // - 订阅 Leader 的日志 publication
+                //   * channel: Leader 的 logChannel
+                //   * streamId: logStreamId
+                // - 等待订阅成功
+                // - 转换到 FOLLOWER_REPLAY
+                //
+                // 关键操作：aeron.addSubscription(logChannel, logStreamId)
                 workCount += followerLogReplication(nowNs);
                 break;
 
+            // ==================== 阶段 6b: Follower 日志重放 ====================
             case FOLLOWER_REPLAY:
+                // Follower 日志重放阶段：重放未提交的日志
+                // 职责：
+                // - 从上次提交位置重放到 Leader 通知的位置
+                // - 确保 Follower 状态与日志一致
+                // - 根据日志差距决定下一步：
+                //   * 日志一致 → FOLLOWER_LOG_INIT（直接进入日志初始化）
+                //   * 日志落后 → FOLLOWER_CATCHUP_INIT（需要从 Leader 追赶日志）
+                //
+                // 日志差距判断：logPosition < leaderLogPosition
                 workCount += followerReplay(nowNs);
                 break;
 
+            // ==================== 阶段 7b: Follower 追赶初始化 ====================
             case FOLLOWER_CATCHUP_INIT:
+                // Follower 追赶初始化阶段：准备从 Leader 同步落后的日志
+                // 职责：
+                // - 向 Leader 发送 CatchupRequest 请求
+                //   * fromPosition: 需要追赶的起始位置
+                // - 等待 Leader 创建 catchup publication
+                // - 转换到 FOLLOWER_CATCHUP_AWAIT
+                //
+                // 为什么需要追赶？
+                // - Follower 的日志落后于 Leader（如节点重启、网络延迟）
+                // - 直接从 Archive 同步落后的日志，比逐条重放更快
                 workCount += followerCatchupInit(nowNs);
                 break;
 
+            // ==================== 阶段 8b: Follower 等待追赶 ====================
             case FOLLOWER_CATCHUP_AWAIT:
+                // Follower 等待追赶阶段：等待 Leader 提供的 catchup publication 就绪
+                // 职责：
+                // - 等待 Leader 返回 CatchupPosition 消息（包含 recordingId）
+                // - 订阅 catchup publication
+                // - 转换到 FOLLOWER_CATCHUP
+                //
+                // CatchupPosition 包含：
+                // - recordingId: Leader 为此追赶创建的 Archive 录制 ID
+                // - catchupEndpoint: catchup publication 的端点地址
                 workCount += followerCatchupAwait(nowNs);
                 break;
 
+            // ==================== 阶段 9b: Follower 追赶中 ====================
             case FOLLOWER_CATCHUP:
+                // Follower 追赶阶段：从 Leader 同步落后的日志
+                // 职责：
+                // - 从 catchup publication 接收日志
+                // - 写入本地 Archive
+                // - 重放追赶的日志，更新业务状态
+                // - 追赶完成后转换到 FOLLOWER_LOG_INIT
+                //
+                // 追赶完成条件：catchupPosition >= targetPosition
                 workCount += followerCatchup(nowNs);
                 break;
 
+            // ==================== 阶段 10b: Follower 日志初始化 ====================
             case FOLLOWER_LOG_INIT:
+                // Follower 日志初始化阶段：准备接收 Leader 的实时日志
+                // 职责：
+                // - 从 Archive 加载 catchup 的日志（如果有）
+                // - 准备订阅 Leader 的实时日志
+                // - 转换到 FOLLOWER_LOG_AWAIT
+                //
+                // 此阶段确保 Follower 已追赶到 Leader 的最新位置
                 workCount += followerLogInit(nowNs);
                 break;
 
+            // ==================== 阶段 11b: Follower 等待日志 ====================
             case FOLLOWER_LOG_AWAIT:
+                // Follower 等待日志阶段：等待日志订阅就绪
+                // 职责：
+                // - 等待日志订阅连接到 Leader
+                // - 等待 Image 可用（订阅建立完成）
+                // - 转换到 FOLLOWER_READY
+                //
+                // Image: Aeron 中表示一个订阅连接
                 workCount += followerLogAwait(nowNs);
                 break;
 
+            // ==================== 阶段 12b: Follower 就绪 ====================
             case FOLLOWER_READY:
+                // Follower 就绪阶段：通知 Leader 自己已就绪
+                // 职责：
+                // - 向 Leader 发送 AppendPosition 消息（确认已就绪）
+                //   * logPosition: 当前日志位置
+                //   * leadershipTermId: 当前 leadership term ID
+                // - 选举结束
+                // - 返回到 ConsensusModuleAgent，切换到 ACTIVE 状态
+                //
+                // 结束标志：election = null
                 workCount += followerReady(nowNs);
                 break;
 
+            // ==================== 终止状态 ====================
             case CLOSED:
+                // 选举已关闭：不执行任何操作
+                // 当 Election 对象被关闭时进入此状态
+                // 原因：ConsensusModule 关闭、集群终止等
                 break;
         }
 
+        // ==================== 返回工作量 ====================
+        // workCount 用于 ConsensusModuleAgent 的 idle 策略：
+        // - workCount == 0: 调用 idleStrategy.idle()（降低 CPU 占用）
+        // - workCount > 0: 调用 idleStrategy.reset()（保持高效率）
         return workCount;
     }
 

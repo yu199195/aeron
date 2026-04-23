@@ -286,6 +286,14 @@ public final class AeronArchive implements AutoCloseable
     /**
      * Connect to an Aeron archive by providing a {@link Context}. This will create a control session.
      * <p>
+     * 连接流程：通过 asyncConnect → poll 同步轮询完成。
+     * <ol>
+     *     <li><b>asyncConnect(ctx)</b>：创建 AsyncConnect，内部 ctx.conclude() 后，
+     *     aeron.asyncAddSubscription(controlResponseChannel) 订阅 Archive 响应通道。</li>
+     *     <li><b>poll() 循环</b>：按状态机推进：AWAIT_SUBSCRIPTION → ADD_PUBLICATION → SEND_CONNECT_REQUEST
+     *     → AWAIT_CONNECT_RESPONSE → (可选) SEND_ARCHIVE_ID_REQUEST → DONE；用 idleStrategy 空转等待。</li>
+     *     <li>成功后返回 AeronArchive，持有关联的 ArchiveProxy（发请求）和 ControlResponsePoller（收响应）。</li>
+     * </ol>
      * Before connecting {@link Context#conclude()} will be called.
      * If an exception occurs then {@link Context#close()} will be called.
      *
@@ -338,6 +346,9 @@ public final class AeronArchive implements AutoCloseable
     /**
      * Begin an attempt at creating a connection which can be completed by calling {@link AsyncConnect#poll()} until
      * it returns the client, before complete it will return null.
+     * <p>
+     * 内部创建 AsyncConnect 实例；其构造函数中执行 ctx.conclude()，并调用 aeron.asyncAddSubscription
+     * 订阅 controlResponseChannel，初始状态为 AWAIT_SUBSCRIPTION。
      *
      * @param ctx for the archive connection.
      * @return the {@link AsyncConnect} that can be polled for completion.
@@ -3743,6 +3754,11 @@ public final class AeronArchive implements AutoCloseable
 
     /**
      * Allows for the async establishment of an archive session.
+     * <p>
+     * 异步建立 Archive 控制会话的状态机实现。通过 poll() 按步骤推进：
+     * AWAIT_SUBSCRIPTION → ADD_PUBLICATION → AWAIT_PUBLICATION_CONNECTED → SEND_CONNECT_REQUEST
+     * → AWAIT_SUBSCRIPTION_CONNECTED → AWAIT_CONNECT_RESPONSE → (可选 SEND_ARCHIVE_ID_REQUEST/响应)
+     * → DONE。每步需 runInvokers() 驱动 Aeron Conductor 处理异步注册。
      */
     public static final class AsyncConnect implements AutoCloseable
     {
@@ -3817,6 +3833,10 @@ public final class AeronArchive implements AutoCloseable
         private ArchiveProxy archiveProxy;
         private AeronArchive aeronArchive;
 
+        /**
+         * 初始化：ctx.conclude() 校验并填充 Context；订阅 controlResponseChannel 等待 Archive 响应，
+         * 初始状态 AWAIT_SUBSCRIPTION；设置 deadlineNs 用于 connect 超时检查。
+         */
         AsyncConnect(final Context ctx)
         {
             ctx.conclude();
@@ -3910,9 +3930,9 @@ public final class AeronArchive implements AutoCloseable
         }
 
         /**
-         * Poll for a complete connection.
+         * Poll for a complete connection. 每轮：checkDeadline → ctx.runInvokers() → 按当前 state 执行对应步骤。
          *
-         * @return a new {@link AeronArchive} if successfully connected otherwise null.
+         * @return a new {@link AeronArchive} if successfully connected (state==DONE), otherwise null.
          */
         @SuppressWarnings("MethodLength")
         public AeronArchive poll()
@@ -3966,6 +3986,7 @@ public final class AeronArchive implements AutoCloseable
             return null;
         }
 
+        /** 检查 connect 是否超时或线程被中断，超时则抛 TimeoutException。 */
         private void checkDeadline()
         {
             if (deadlineNs - ctx.aeron().context().nanoClock().nanoTime() < 0)
@@ -3983,6 +4004,7 @@ public final class AeronArchive implements AutoCloseable
             }
         }
 
+        /** 等待 controlResponse Subscription 注册完成，创建 ControlResponsePoller，转入 ADD_PUBLICATION。 */
         private void awaitSubscription()
         {
             final Subscription subscription = ctx.aeron().getSubscription(subscriptionRegistrationId);
@@ -4001,6 +4023,7 @@ public final class AeronArchive implements AutoCloseable
             }
         }
 
+        /** 添加 controlRequest 的 ExclusivePublication，创建 ArchiveProxy，转入 AWAIT_PUBLICATION_CONNECTED。 */
         private void addPublication()
         {
             final Aeron aeron = ctx.aeron();
@@ -4038,6 +4061,7 @@ public final class AeronArchive implements AutoCloseable
             }
         }
 
+        /** 解析 responseChannel 端口后，通过 archiveProxy.tryConnect 发送 connect 请求到 Archive，转入 AWAIT_CONNECT_RESPONSE。 */
         private void sendConnectRequest()
         {
             final String responseChannel = controlResponsePoller.subscription().tryResolveChannelEndpointPort();
@@ -4075,6 +4099,7 @@ public final class AeronArchive implements AutoCloseable
             }
         }
 
+        /** 轮询 ControlResponsePoller；收到 connect 或 archive-id 响应后解析 controlSessionId，可选发送 challenge 或 transitionToDone。 */
         private void pollForResponse()
         {
             controlResponsePoller.poll();
@@ -4137,6 +4162,7 @@ public final class AeronArchive implements AutoCloseable
             state = newState;
         }
 
+        /** 发送 keepAlive 后构造 AeronArchive 实例，state 置为 DONE，返回客户端。 */
         private AeronArchive transitionToDone(final long archiveId)
         {
             if (!archiveProxy.keepAlive(controlSessionId, NULL_VALUE))

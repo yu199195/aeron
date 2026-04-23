@@ -1103,11 +1103,46 @@ project(':aeron-samples') {
     apply plugin: 'maven-publish'
     apply plugin: 'signing'
 
+    configurations {
+        codecGeneration
+    }
+
     dependencies {
         api project(':aeron-cluster')
         implementation libs.hdrHistogram
         testImplementation project(':aeron-test-support')
+        codecGeneration libs.sbe
+        api files('build/classes/java/generated')
     }
+
+    def generatedSrcDir = file("${layout.buildDirectory.get()}/generated-src")
+
+    sourceSets {
+        generated {
+            java.srcDir generatedSrcDir
+            compileClasspath += configurations.codecGeneration
+        }
+    }
+
+    def codecsFile = 'src/main/resources/messaging-schema.xml'
+    def sbeFile = '../aeron-cluster/src/main/resources/cluster/fpl/sbe.xsd'
+
+    tasks.register('generateCodecs', JavaExec) {
+        inputs.files(codecsFile, sbeFile)
+        outputs.dir generatedSrcDir
+
+        mainClass.set('uk.co.real_logic.sbe.SbeTool')
+        classpath = configurations.codecGeneration
+        systemProperties(
+            'sbe.output.dir': generatedSrcDir,
+            'sbe.target.language': 'Java',
+            'sbe.validation.xsd': sbeFile,
+            'sbe.validation.stop.on.error': 'true')
+        args = [codecsFile]
+    }
+
+    compileJava.dependsOn 'compileGeneratedJava'
+    compileGeneratedJava.dependsOn 'generateCodecs'
 
     java {
         withSourcesJar()

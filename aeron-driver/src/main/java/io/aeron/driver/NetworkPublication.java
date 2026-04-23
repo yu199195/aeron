@@ -118,7 +118,30 @@ class NetworkPublicationPadding3 extends NetworkPublicationSenderFields
 }
 
 /**
- * Publication to be sent to connected subscribers.
+ * 【源码解析】NetworkPublication —— Driver 侧的网络发布端，是 Aeron 可靠 UDP 传输的核心枢纽。
+ * <p>
+ * 职责：
+ * 1. 【数据发送】从 LogBuffer（Term Buffer）中读取应用线程 offer 的数据帧，通过 UDP 发送到网络
+ * 2. 【流控】处理接收端的 Status Message(SM)，更新 senderLimit，驱动端到端流控
+ * 3. 【NAK 重传】处理接收端的 NAK，从 Term Buffer 中重传丢失的数据帧
+ * 4. 【连接管理】发送 SETUP 帧建立流、发送心跳帧维持活性
+ * 5. 【拥塞控制】通过 FlowControl 策略根据 SM 中的 receiverWindowLength 限制发送速率
+ * <p>
+ * 线程模型：
+ * - Sender 线程调用 send()、sendData()、heartbeatMessageCheck()、resend()
+ * - Conductor 线程调用 updatePublisherPositionAndLimit()、onStatusMessage()、onNak()
+ * - 通过 cache line padding 隔离不同线程访问的字段，避免 false sharing
+ * <p>
+ * 关键 Position 链（端到端流控）：
+ * publisherPos → senderPosition → senderLimit ← SM(consumptionPos + window)
+ *                                                     ↑ FlowControl 计算
+ * publisherLimit ← Conductor 根据 senderPosition + spy 位置计算
+ * <p>
+ * 【Archive 回放与本类的衔接】（{@code aeron-driver} 不依赖 archive 模块，此处不引用具体回放类名）
+ * Archive 等服务进程通过 {@link io.aeron.ExclusivePublication#offerBlock(org.agrona.MutableDirectBuffer, int, int)} 写入的 term，与本
+ * {@code NetworkPublication} 所绑定的 {@link RawLog} 为同一映射内存；{@link Sender} 在
+ * {@link Sender#doWork()} 中调用 {@link #send(long)} → {@link #sendData} → {@link #doSend} →
+ * {@link SendChannelEndpoint}，最终在 {@link java.nio.channels.DatagramChannel} 上发出 UDP。
  */
 public final class NetworkPublication
     extends NetworkPublicationPadding3
@@ -127,7 +150,10 @@ public final class NetworkPublication
     @SuppressWarnings("JavadocVariable")
     enum State
     {
-        ACTIVE, DRAINING, LINGER, DONE
+        ACTIVE,    // 正常活跃
+        DRAINING,  // 关闭中，等待数据发送完毕
+        LINGER,    // 数据发完，短暂保留以处理迟到的 NAK
+        DONE       // 完全关闭，可回收
     }
 
     private final long registrationId;
@@ -433,24 +459,41 @@ public final class NetworkPublication
     }
 
     /**
-     * Process a NAK message so a retransmit can occur.
+     * 【NAK 处理入口】收到接收端发来的 NAK 帧时由 SendChannelEndpoint 调用。
+     * <p>
+     * NAK 含义："我在 termId 的 [termOffset, termOffset+length) 没收到数据，请重传。"
+     * <p>
+     * 处理链：onNak() → RetransmitHandler.onNak() → (延迟或立即) → this.resend()
      *
-     * @param termId     in which the loss occurred.
-     * @param termOffset at which the loss begins.
-     * @param length     of the loss.
+     * @param termId     丢失数据所在的 term ID
+     * @param termOffset 丢失数据的起始偏移
+     * @param length     丢失数据的长度
      */
     public void onNak(final int termId, final int termOffset, final int length)
     {
         senderNaksReceived.incrementRelease();
+        // 委托给 RetransmitHandler：校验合法性 → 去重 → 延迟或立即调用 this.resend()
         retransmitHandler.onNak(termId, termOffset, length, termBufferLength, mtuLength, flowControl, this);
     }
 
     /**
-     * Process a status message to track connectivity and apply flow control.
+     * 【Status Message 处理入口】收到接收端发来的 SM 时调用。这是流控的核心驱动入口。
+     * <p>
+     * SM 包含：
+     * - consumptionTermId + consumptionTermOffset：接收端已消费到的位置
+     * - receiverWindowLength：接收端愿意接收的窗口大小（由 CongestionControl 决定）
+     * - receiverId：接收端标识
+     * - flags：END_OF_STREAM_FLAG 表示接收端关闭
+     * <p>
+     * 处理逻辑：
+     * 1. 更新接收端活性追踪（livenessTracker）
+     * 2. 通过 FlowControl.onStatusMessage() 计算新的 senderLimit
+     *    senderLimit = max(当前limit, consumptionPosition + receiverWindowLength)
+     * 3. 更新连接状态
      *
-     * @param msg            flyweight over the network packet.
-     * @param srcAddress     that the setup message has come from.
-     * @param conductorProxy to send messages back to the conductor.
+     * @param msg            SM 帧的 flyweight
+     * @param srcAddress     发送 SM 的接收端地址
+     * @param conductorProxy Conductor 代理（用于通知连接状态变化）
      */
     public void onStatusMessage(
         final StatusMessageFlyweight msg,
@@ -462,6 +505,7 @@ public final class NetworkPublication
 
         if (isEos)
         {
+            // 接收端通知流结束，从活性追踪中移除
             livenessTracker.onRemoteClose(msg.receiverId());
 
             if (!channelEndpoint.udpChannel().isMulticast() &&
@@ -472,6 +516,7 @@ public final class NetworkPublication
         }
         else
         {
+            // 正常 SM：更新接收端活性时间戳
             livenessTracker.onStatusMessage(msg.receiverId(), timeNs);
         }
 
@@ -490,11 +535,13 @@ public final class NetworkPublication
 
         if (!hasInitialConnection)
         {
-            hasInitialConnection = true;
+            hasInitialConnection = true; // 收到第一个 SM → 连接已建立
         }
 
         timeOfLastStatusMessageNs = timeNs;
 
+        // 【核心流控更新】通过 FlowControl 策略计算新的 senderLimit
+        // UnicastFlowControl: max(senderLimit, consumptionPosition + receiverWindowLength)
         senderLimit.setRelease(flowControl.onStatusMessage(
             msg,
             srcAddress,
@@ -565,6 +612,12 @@ public final class NetworkPublication
         // handling of RTT measurements would be done in an else clause here.
     }
 
+    /**
+     * 统一出口：把待发送的 {@link ByteBuffer}（通常为 term 的 mmap slice，或 SETUP/心跳等小缓冲区）交给
+     * {@link SendChannelEndpoint}。Response 模式且已解析出对端地址时用
+     * {@link SendChannelEndpoint#send(ByteBuffer, java.net.InetSocketAddress)}；否则用已与远端
+     * {@code connect} 的 {@link SendChannelEndpoint#send(ByteBuffer)}，减少每包路由开销。
+     */
     private int doSend(final ByteBuffer message)
     {
         if (isResponse)
@@ -585,7 +638,23 @@ public final class NetworkPublication
     }
 
     /**
-     * {@inheritDoc}
+     * 【重传执行】由 RetransmitHandler 超时或立即触发，从 Term Buffer 中重传指定范围的数据帧。
+     * <p>
+     * 重传安全窗口校验：
+     * resendPosition 必须在 [bottomResendWindow, senderPosition) 范围内，
+     * 否则可能读到已被清理（zeroed）的旧数据。
+     * bottomResendWindow = senderPosition - termBufferLength/2 - maxMessageLength
+     * <p>
+     * 重传逻辑：
+     * 1. 计算 resendPosition 对应的 term index 和 offset
+     * 2. 逐 MTU 扫描已完成帧（scanForAvailability），通过 UDP 发送
+     * 3. 直到 remainingBytes 耗尽或遇到未完成帧
+     * <p>
+     * 与正常发送的区别：重传不更新 senderPosition（它只是补发旧数据）。
+     *
+     * @param termId     要重传的 term ID
+     * @param termOffset 要重传的起始偏移
+     * @param length     要重传的总长度
      */
     public void resend(final int termId, final int termOffset, final int length)
     {
@@ -593,9 +662,11 @@ public final class NetworkPublication
 
         final long senderPosition = this.senderPosition.get();
         final long resendPosition = computePosition(termId, termOffset, positionBitsToShift, initialTermId);
+        // 安全窗口下界：senderPosition 之前的半个 term + maxMessageLength 是可重传的最远距离
         final long bottomResendWindow =
             senderPosition - (termBufferLength >> 1) - FrameDescriptor.computeMaxMessageLength(termBufferLength);
 
+        // 安全检查：resendPosition 必须在可重传窗口内
         if (bottomResendWindow <= resendPosition && resendPosition < senderPosition)
         {
             final int activeIndex = indexByPosition(resendPosition, positionBitsToShift);
@@ -610,13 +681,15 @@ public final class NetworkPublication
             {
                 offset += bytesSent;
 
+                // 逐 MTU 扫描已完成帧
                 final long scanOutcome = scanForAvailability(termBuffer, offset, Math.min(mtuLength, remainingBytes));
                 final int available = available(scanOutcome);
                 if (available <= 0)
                 {
-                    break;
+                    break; // 该位置的帧尚未完成，停止重传
                 }
 
+                // 零拷贝发送：直接从 mmap ByteBuffer 的 slice 发出
                 sendBuffer.limit(offset + available).position(offset);
 
                 if (available != doSend(sendBuffer))
@@ -639,25 +712,43 @@ public final class NetworkPublication
         }
     }
 
+    /**
+     * 【Sender 线程调用的核心方法】每个 Publication 每次被 Sender 轮询时执行。
+     * <p>
+     * 完整流程：
+     * 1. SETUP 检查：若尚未建立连接或被请求发 SETUP → 发送 SETUP 帧
+     * 2. sendData()：从 LogBuffer 读取数据帧，通过 UDP 发送（受 senderLimit 流控限制）
+     * 3. 若没发数据 → 心跳检查：发送心跳帧（DATA 帧但 length=0）维持连接活性
+     * 4. FlowControl.onIdle()：空闲时更新 senderLimit（多播策略可能在此做超时清理）
+     * 5. processTimeouts()：处理 RetransmitHandler 中延迟的重传动作
+     *
+     * @param nowNs 当前时间
+     * @return 本次发送的字节数
+     */
     int send(final long nowNs)
     {
         final long senderPosition = this.senderPosition.get();
         final int activeTermId = computeTermIdFromPosition(senderPosition, positionBitsToShift, initialTermId);
         final int termOffset = (int)senderPosition & termLengthMask;
 
+        // 步骤 1：连接建立 —— 发送 SETUP 帧
         if (!hasInitialConnection || isSetupElicited)
         {
             setupMessageCheck(nowNs, activeTermId, termOffset);
         }
 
+        // 步骤 2：发送数据
         int bytesSent = sendData(nowNs, senderPosition, termOffset);
 
         if (0 == bytesSent)
         {
+            // 步骤 3：无数据可发 → 心跳检查
             bytesSent = heartbeatMessageCheck(nowNs, activeTermId, termOffset);
 
+            // 步骤 4：空闲时流控维护
             if (spiesSimulateConnection && hasSpies && !hasReceivers)
             {
+                // Spy 模拟连接：直接推进 senderPosition 到最快的 spy
                 final long newSenderPosition = maxSpyPosition(senderPosition);
                 this.senderPosition.setRelease(newSenderPosition);
                 senderLimit.setRelease(flowControl.onIdle(nowNs, newSenderPosition, newSenderPosition, isEndOfStream));
@@ -670,6 +761,7 @@ public final class NetworkPublication
             updateHasReceivers(nowNs);
         }
 
+        // 步骤 5：处理重传超时（DELAYED → resend、LINGERING → 释放槽位）
         retransmitHandler.processTimeouts(nowNs, this);
 
         return bytesSent;
@@ -742,9 +834,18 @@ public final class NetworkPublication
     }
 
     /**
-     * Update the publisher position and limit for flow control as part of the conductor duty cycle.
+     * 【Conductor 线程调用】更新 publisherPos 和 publisherLimit，实现应用端背压控制。
+     * <p>
+     * publisherLimit 决定应用线程 offer() 能写到多远：
+     * publisherLimit = min(所有消费者位置) + termWindowLength
+     * <p>
+     * "所有消费者" 包括 senderPosition（远端接收端进度）和所有 spy 的位置。
+     * 这保证了写入不会超过最慢的消费者一个 termWindowLength（通常 = termBufferLength/2），
+     * 避免覆盖尚未被消费的数据。
+     * <p>
+     * 此外还负责 cleanBuffer：清零已被所有消费者消费过的 term 区域（为下次 term 轮转做准备）。
      *
-     * @return 1 if the limit has been updated otherwise 0.
+     * @return 1 如果 limit 发生变化，否则 0
      */
     int updatePublisherPositionAndLimit()
     {
@@ -759,21 +860,25 @@ public final class NetworkPublication
 
             if (hasSubscribers())
             {
+                // 找到最慢的消费者（senderPosition 或最慢的 spy）
                 long minConsumerPosition = senderPosition;
                 for (final ReadablePosition spyPosition : spyPositions)
                 {
                     minConsumerPosition = Math.min(minConsumerPosition, spyPosition.getVolatile());
                 }
 
+                // publisherLimit = 最慢消费者 + termWindowLength
                 final long newLimitPosition = minConsumerPosition + termWindowLength;
                 if (newLimitPosition > publisherLimit.get())
                 {
+                    // 清理已消费的 term 区域（防止脏数据影响下次 term 轮转）
                     cleanBufferTo(minConsumerPosition - termBufferLength);
                     final long cleanPosition = this.cleanPosition;
                     final int dirtyTermId =
                         computeTermIdFromPosition(cleanPosition, positionBitsToShift, initialTermId);
                     final int activeTermId =
                         computeTermIdFromPosition(newLimitPosition, positionBitsToShift, initialTermId);
+                    // 防止 limit 跑到未清理的 term 上（term gap < 2 才安全）
                     final int termGap = activeTermId - dirtyTermId;
                     if (termGap < 2 || (2 == termGap && 0 != (int)(cleanPosition & termLengthMask)))
                     {
@@ -784,6 +889,7 @@ public final class NetworkPublication
             }
             else if (publisherLimit.get() > senderPosition)
             {
+                // 无订阅者：收回 limit 到 senderPosition（停止写入）
                 updateConnectedState(false);
                 publisherLimit.setRelease(senderPosition);
                 cleanBufferTo(senderPosition - termBufferLength);
@@ -812,19 +918,40 @@ public final class NetworkPublication
         timeOfLastUpdateReceivers = timeNs;
     }
 
+    /**
+     * 【数据发送核心】从 Term Buffer 读取已完成的帧，通过 UDP 发送到网络。
+     * <p>
+     * 流控检查：availableWindow = senderLimit - senderPosition
+     * - > 0：有窗口余量，可发送（但不超过 MTU）
+     * - ≤ 0：流控限制，不发送（senderFlowControlLimits++）
+     * <p>
+     * 扫描 + 发送：
+     * 1. scanForAvailability(termBuffer, termOffset, scanLimit) → 找出连续已完成帧
+     * 2. 零拷贝发送：sendBuffer.limit/position → channelEndpoint.send(sendBuffer) → DatagramChannel.write()
+     * 3. 成功后更新 senderPosition
+     *
+     * @param nowNs          当前时间
+     * @param senderPosition 当前发送位置（绝对 position）
+     * @param termOffset     发送位置在 term 内的偏移
+     * @return 发送字节数
+     */
     private int sendData(final long nowNs, final long senderPosition, final int termOffset)
     {
         int bytesSent = 0;
+        // 流控检查：senderLimit 由 SM → FlowControl.onStatusMessage() 更新
         final int availableWindow = (int)(senderLimit.get() - senderPosition);
         if (availableWindow > 0)
         {
+            // 本次最多扫描/发送 min(可用窗口, MTU) 字节
             final int scanLimit = Math.min(availableWindow, mtuLength);
             final int activeIndex = indexByPosition(senderPosition, positionBitsToShift);
 
+            // 扫描 Term Buffer 中已完成的帧
             final long scanOutcome = scanForAvailability(termBuffers[activeIndex], termOffset, scanLimit);
             final int available = available(scanOutcome);
             if (available > 0)
             {
+                // 零拷贝发送：直接从 mmap 的 ByteBuffer slice 发出
                 final ByteBuffer sendBuffer = sendBuffers[activeIndex];
                 sendBuffer.limit(termOffset + available).position(termOffset);
 
@@ -833,16 +960,18 @@ public final class NetworkPublication
                     timeOfLastDataOrHeartbeatNs = nowNs;
                     trackSenderLimits = true;
 
+                    // 推进 senderPosition（包括 padding 部分）
                     bytesSent = available + padding(scanOutcome);
                     this.senderPosition.setRelease(senderPosition + bytesSent);
                 }
                 else
                 {
-                    shortSends.increment();
+                    shortSends.increment(); // 操作系统发送缓冲区满，部分发送
                 }
             }
             else if (available < 0)
             {
+                // available < 0：有数据但单帧超过 scanLimit → 流控限制
                 if (trackSenderLimits)
                 {
                     trackSenderLimits = false;
@@ -853,6 +982,7 @@ public final class NetworkPublication
         }
         else if (trackSenderLimits)
         {
+            // 流控窗口耗尽：senderPosition 已追上 senderLimit
             trackSenderLimits = false;
             senderBpe.incrementRelease();
             senderFlowControlLimits.incrementRelease();
@@ -861,6 +991,18 @@ public final class NetworkPublication
         return bytesSent;
     }
 
+    /**
+     * 【SETUP 帧发送检查】周期性发送 SETUP 帧以建立或恢复与接收端的连接。
+     * <p>
+     * SETUP 帧告诉接收端：
+     * - sessionId / streamId：流标识
+     * - initialTermId / termLength / mtuLength：流参数（接收端据此初始化 LogBuffer）
+     * - activeTermId / termOffset：当前发送位置（接收端据此设置初始接收位置）
+     * <p>
+     * 发送时机：
+     * - hasInitialConnection == false：首次建连，周期性发 SETUP 直到收到 SM
+     * - isSetupElicited == true：接收端通过 SM 请求重发 SETUP（接收端可能刚启动/重建）
+     */
     private void setupMessageCheck(final long nowNs, final int activeTermId, final int termOffset)
     {
         if ((timeOfLastSetupNs + PUBLICATION_SETUP_TIMEOUT_NS) - nowNs < 0)
@@ -895,11 +1037,22 @@ public final class NetworkPublication
 
             if (isSetupElicited && hasReceivers)
             {
-                isSetupElicited = false;
+                isSetupElicited = false; // 已有接收端响应，停止周期发 SETUP
             }
         }
     }
 
+    /**
+     * 【心跳帧发送检查】在没有数据可发时，周期性发送心跳帧维持连接活性。
+     * <p>
+     * 心跳帧 = DATA 帧但 frameLength == HEADER_LENGTH（32字节，无负载）。
+     * 接收端根据心跳更新最后收到数据的时间戳，避免超时断连。
+     * <p>
+     * 特殊 flags：
+     * - BEGIN_AND_END_FLAGS：正常心跳
+     * - BEGIN_END_AND_EOS_FLAGS：流结束的心跳
+     * - BEGIN_END_EOS_AND_REVOKED_FLAGS：Publication 被撤销的心跳
+     */
     private int heartbeatMessageCheck(
         final long nowNs, final int activeTermId, final int termOffset)
     {
@@ -930,7 +1083,7 @@ public final class NetworkPublication
                 .termOffset(termOffset)
                 .flags(flags);
 
-            bytesSent = doSend(heartbeatBuffer);
+            bytesSent = doSend(heartbeatBuffer); // 发送心跳（DATA 帧，长度 = 32B）
             if (DataHeaderFlyweight.HEADER_LENGTH != bytesSent)
             {
                 shortSends.increment();

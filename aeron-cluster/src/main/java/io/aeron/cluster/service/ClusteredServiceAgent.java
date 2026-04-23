@@ -170,40 +170,144 @@ final class ClusteredServiceAgent extends ClusteredServiceAgentRhsPadding implem
     private TimeUnit timeUnit = null;
     private long requestedAckPosition = NULL_POSITION;
 
+    /**
+     * ClusteredServiceAgent 构造函数：创建 Service 的核心代理。
+     * <p>
+     * 这是 ClusteredServiceContainer 的核心组件，负责：
+     * <ul>
+     *   <li>接收 ConsensusModule 的命令（通过 serviceAdapter）</li>
+     *   <li>消费日志，调用 ClusteredService 回调方法</li>
+     *   <li>管理客户端会话（创建、关闭、消息发送）</li>
+     *   <li>执行快照保存和加载</li>
+     *   <li>与 ConsensusModule 双向通信</li>
+     * </ul>
+     * <p>
+     * <b>通信架构</b>：
+     * <pre>
+     * ConsensusModule                          ClusteredServiceAgent
+     *        │                                          │
+     *        ├─> serviceControlPublication             │
+     *        │        └─────────────────────────────> serviceAdapter (订阅)
+     *        │                                          │
+     *        │   发送命令：                              │   接收命令：
+     *        │   ├─ JOIN_LOG                           ├─ onJoinLog()
+     *        │   ├─ SERVICE_TERMINATION_POSITION       ├─ onServiceTerminationPosition()
+     *        │   └─ REQUEST_SERVICE_ACK                └─ onRequestServiceAck()
+     *        │                                          │
+     *        │ <──────────────────────────────────── consensusModuleProxy (发布)
+     *        │                                          │
+     *        └─ 接收 ACK：                             └─> 发送 ACK：
+     *           - SERVICE_ACK                              - consensusModuleProxy.ack()
+     * </pre>
+     *
+     * @param ctx ClusteredServiceContainer 配置上下文（已完成 conclude()）
+     */
     ClusteredServiceAgent(final ClusteredServiceContainer.Context ctx)
     {
+        // ==================== 步骤 1: 创建日志适配器 ====================
+        // logAdapter 用于消费 Leader 发布的日志消息
+        // - ctx.logFragmentLimit(): 每次 poll() 最多处理的消息数量（默认 50）
         logAdapter = new BoundedLogAdapter(this, ctx.logFragmentLimit());
+
+        // ==================== 步骤 2: 保存配置引用 ====================
         this.ctx = ctx;
 
-        markFile = ctx.clusterMarkFile();
-        aeron = ctx.aeron();
-        aeronAgentInvoker = ctx.aeron().conductorAgentInvoker();
-        service = ctx.clusteredService();
-        idleStrategy = ctx.idleStrategy();
-        serviceId = ctx.serviceId();
-        epochClock = ctx.epochClock();
-        nanoClock = ctx.nanoClock();
-        dutyCycleTracker = ctx.dutyCycleTracker();
-        snapshotDurationTracker = ctx.snapshotDurationTracker();
-        subscriptionAlias = "log-sc-" + ctx.serviceId();
+        // ==================== 步骤 3: 初始化基础组件 ====================
+        markFile = ctx.clusterMarkFile();  // ← Mark File（进程协调、活跃性检测）
+        aeron = ctx.aeron();  // ← Aeron 客户端（用于通信）
+        aeronAgentInvoker = ctx.aeron().conductorAgentInvoker();  // ← Aeron 代理调用器（用于手动驱动）
+        service = ctx.clusteredService();  // ← 业务逻辑实现（ClusteredService 接口）
+        idleStrategy = ctx.idleStrategy();  // ← 空闲策略（无工作时降低 CPU 占用）
+        serviceId = ctx.serviceId();  // ← Service ID（0-9，每个节点可运行多个 Service）
+        epochClock = ctx.epochClock();  // ← 纪元时钟（用于时间戳）
+        nanoClock = ctx.nanoClock();  // ← 纳秒时钟（用于高精度计时）
+        dutyCycleTracker = ctx.dutyCycleTracker();  // ← Duty Cycle 追踪器（监控 doWork() 耗时）
+        snapshotDurationTracker = ctx.snapshotDurationTracker();  // ← 快照耗时追踪器（监控快照性能）
+        subscriptionAlias = "log-sc-" + ctx.serviceId();  // ← 日志订阅别名（便于识别）
 
-        final String channel = ctx.controlChannel();
+        // ==================== 步骤 4: 创建与 ConsensusModule 的双向通信通道 ====================
+        final String channel = ctx.controlChannel();  // ← 控制通道（IPC，通常是 "aeron:ipc?term-length=128k"）
+
+        // 4.1 创建 ConsensusModule Publication（Service → ConsensusModule）
+        // 用途：向 ConsensusModule 发送 ACK 消息
+        // - SERVICE_ACK: 确认命令执行完成
+        // - SNAPSHOT_COMPLETE: 确认快照保存完成
         consensusModuleProxy = new ConsensusModuleProxy(aeron.addPublication(channel, ctx.consensusModuleStreamId()));
+
+        // 4.2 创建 Service Subscription（ConsensusModule → Service）
+        // 用途：接收 ConsensusModule 发送的命令
+        // - JOIN_LOG: 加入日志消费
+        // - SERVICE_TERMINATION_POSITION: 终止位置
+        // - REQUEST_SERVICE_ACK: 请求确认
         serviceAdapter = new ServiceAdapter(aeron.addSubscription(channel, ctx.serviceStreamId()), this);
+
+        // ==================== 步骤 5: 初始化会话消息编码器 ====================
+        // 用于向客户端发送响应消息时的头部编码
         sessionMessageHeaderEncoder.wrapAndApplyHeader(headerBuffer, 0, new MessageHeaderEncoder());
+
+        // ==================== 步骤 6: 设置快照标志 ====================
+        // standbySnapshotEnabled: 是否在 Follower 状态下也执行快照
+        // - true: CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT（Follower 也快照）
+        // - false: CLUSTER_ACTION_FLAGS_DEFAULT（只有 Leader 快照）
         this.standbySnapshotFlags = ctx.standbySnapshotEnabled() ? CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT :
             CLUSTER_ACTION_FLAGS_DEFAULT;
     }
 
+    /**
+     * Agent 启动回调：在 AgentRunner 启动线程后调用。
+     * <p>
+     * 这是 ClusteredServiceAgent 的初始化入口，负责：
+     * <ul>
+     *   <li>注册关闭和计数器不可用处理器</li>
+     *   <li>等待 commit position 计数器就绪</li>
+     *   <li>恢复 Service 状态（加载快照、调用 service.onStart()）</li>
+     *   <li>向 ConsensusModule 发送就绪 ACK</li>
+     * </ul>
+     * <p>
+     * <b>执行流程</b>：
+     * <pre>
+     * 1. 注册处理器（关闭处理器、计数器不可用处理器）
+     * 2. 等待 commit position 计数器（ConsensusModule 创建）
+     * 3. 恢复状态：
+     *    ├─ 读取 Recovery State 计数器
+     *    ├─ 加载快照（如果存在）
+     *    ├─ 调用 service.onStart(this, snapshotImage)
+     *    └─ 发送就绪 ACK 给 ConsensusModule
+     * 4. 标记 Service 为活跃状态
+     * </pre>
+     * <p>
+     * <b>注意</b>：此方法在 Agent 线程上执行，不是主线程。
+     */
     public void onStart()
     {
+        // ==================== 步骤 1: 注册关闭处理器 ====================
+        // 当 Aeron 客户端关闭时，会触发 abort() 方法
         closeHandlerRegistrationId = aeron.addCloseHandler(this::abort);
+
+        // ==================== 步骤 2: 注册计数器不可用处理器 ====================
+        // 当 commit position 计数器关闭时，Service 需要终止
         aeron.addUnavailableCounterHandler(this::counterUnavailable);
+
+        // ==================== 步骤 3: 等待 commit position 计数器 ====================
+        // commit position 由 ConsensusModule 创建，Service 需要等待其就绪
+        // 用途：Service 只消费已提交的日志消息（不消费未提交的）
         final CountersReader counters = aeron.countersReader();
         commitPosition = awaitCommitPositionCounter(counters, ctx.clusterId());
 
+        // ==================== 步骤 4: 恢复 Service 状态 ====================
+        // recoverState() 会：
+        // - 读取 Recovery State 计数器（包含 logPosition、timestamp、leadershipTermId）
+        // - 加载最新快照（如果存在）
+        // - 调用 service.onStart(this, snapshotImage)（业务逻辑恢复状态）
+        // - 发送就绪 ACK 给 ConsensusModule
         recoverState(counters);
+
+        // ==================== 步骤 5: 初始化 Duty Cycle Tracker ====================
+        // 开始追踪 doWork() 循环的耗时
         dutyCycleTracker.update(nanoClock.nanoTime());
+
+        // ==================== 步骤 6: 标记 Service 为活跃状态 ====================
+        // 此后可以开始接收命令和消费日志
         isServiceActive = true;
     }
 
@@ -245,39 +349,122 @@ final class ClusteredServiceAgent extends ClusteredServiceAgentRhsPadding implem
         ctx.close();
     }
 
+    /**
+     * Agent 主工作循环：执行 Service 的核心业务逻辑。
+     * <p>
+     * 这是 ClusteredServiceAgent 的<b>核心方法</b>，在独立线程上持续调用（约 1000 次/秒）。
+     * 负责：
+     * <ul>
+     *   <li>接收 ConsensusModule 的命令（通过 pollServiceAdapter()）</li>
+     *   <li>消费已提交的日志消息（通过 logAdapter.poll()）</li>
+     *   <li>调用业务逻辑的后台工作（service.doBackgroundWork()）</li>
+     *   <li>更新 Mark File 活跃时间戳（用于活跃性检测）</li>
+     * </ul>
+     * <p>
+     * <b>执行频率</b>：
+     * <pre>
+     * while (running) {
+     *     workCount = agent.doWork();  // ← 本方法
+     *     if (workCount == 0) {
+     *         idleStrategy.idle();  // ← 无工作时降低 CPU 占用
+     *     } else {
+     *         idleStrategy.reset();  // ← 有工作时保持高效率
+     *     }
+     * }
+     * </pre>
+     * <p>
+     * <b>工作流程</b>：
+     * <pre>
+     * 1. 更新 Duty Cycle Tracker（追踪循环耗时）
+     * 2. 检查时钟 tick（每 1ms 执行一次）：
+     *    ├─ 调用 Aeron AgentInvoker（手动驱动 Aeron）
+     *    ├─ 更新 Mark File 时间戳（每秒更新一次）
+     *    └─ 接收 ConsensusModule 命令：
+     *       ├─ JOIN_LOG → joinActiveLog()（订阅日志）
+     *       ├─ SERVICE_TERMINATION_POSITION → terminate()（终止 Service）
+     *       └─ REQUEST_SERVICE_ACK → consensusModuleProxy.ack()（发送确认）
+     * 3. 消费日志（如果已订阅）：
+     *    └─ logAdapter.poll(commitPosition) → 调用 ClusteredService 回调：
+     *       ├─ onSessionMessage()（客户端消息）
+     *       ├─ onTimerEvent()（定时器事件）
+     *       ├─ onSessionOpen()（会话打开）
+     *       ├─ onSessionClose()（会话关闭）
+     *       ├─ onServiceAction()（集群动作，如 SNAPSHOT）
+     *       └─ onNewLeadershipTermEvent()（新 Leader 上任）
+     * 4. 调用后台工作：
+     *    └─ service.doBackgroundWork(nowNs)（业务逻辑自定义）
+     * </pre>
+     *
+     * @return 本次执行的工作量（0 表示无工作，>0 表示有工作完成）
+     */
     public int doWork()
     {
+        // ==================== 工作量计数器 ====================
+        // 用于 idle 策略判断：
+        // - 0: 无工作，调用 idleStrategy.idle()（降低 CPU 占用）
+        // - >0: 有工作，调用 idleStrategy.reset()（保持高效率）
         int workCount = 0;
 
+        // ==================== 记录当前时间 ====================
         final long nowNs = nanoClock.nanoTime();
+
+        // ==================== 更新 Duty Cycle Tracker ====================
+        // 追踪本次循环的开始时间，用于监控性能
         dutyCycleTracker.measureAndUpdate(nowNs);
 
         try
         {
+            // ==================== 步骤 1: 检查时钟 tick（每 1ms 执行一次） ====================
+            // checkForClockTick() 会：
+            // - 检查 Aeron 是否关闭（关闭则抛出异常）
+            // - 调用 Aeron AgentInvoker（手动驱动 Aeron 事件循环）
+            // - 更新 Mark File 时间戳（每秒更新一次，供监控工具检测活跃性）
+            // - 返回 true（表示本次是 tick 时刻）
             if (checkForClockTick(nowNs))
             {
+                // ==================== 步骤 2: 接收 ConsensusModule 命令 ====================
+                // pollServiceAdapter() 会：
+                // - 从 serviceAdapter 接收命令（JOIN_LOG、SERVICE_TERMINATION_POSITION、REQUEST_SERVICE_ACK）
+                // - 处理 activeLogEvent（如果有，调用 joinActiveLog()）
+                // - 检查终止位置（如果达到，调用 terminate()）
+                // - 检查请求的 ACK 位置（如果达到，发送 ACK）
                 workCount += pollServiceAdapter();
             }
 
-            if (null != logAdapter.image())
+            // ==================== 步骤 3: 消费日志消息 ====================
+            if (null != logAdapter.image())  // ← 检查是否已订阅日志
             {
+                // 从日志中消费消息（最多 commitPosition.get() 位置）
+                // commitPosition 由 ConsensusModule 更新，表示已提交的位置
+                // Service 只消费已提交的消息（确保一致性）
                 final int polled = logAdapter.poll(commitPosition.get());
                 workCount += polled;
 
+                // 如果本次没有消费到消息，且日志已结束，关闭日志
                 if (0 == polled && logAdapter.isDone())
                 {
-                    closeLog();
+                    closeLog();  // ← 关闭日志订阅，断开客户端会话连接
                 }
             }
 
+            // ==================== 步骤 4: 调用业务逻辑的后台工作 ====================
+            // service.doBackgroundWork() 可用于：
+            // - 执行定期任务（如统计、清理）
+            // - 处理异步操作
+            // - 自定义监控逻辑
             workCount += invokeBackgroundWork(nowNs);
         }
         catch (final AgentTerminationException ex)
         {
+            // ==================== 异常处理：Agent 终止 ====================
+            // 执行终止钩子（用户自定义清理逻辑）
             runTerminationHook();
+            // 重新抛出异常，让 AgentRunner 停止循环
             throw ex;
         }
 
+        // ==================== 返回工作量 ====================
+        // AgentRunner 根据 workCount 决定是否执行 idle 策略
         return workCount;
     }
 
@@ -760,35 +947,111 @@ final class ClusteredServiceAgent extends ClusteredServiceAgentRhsPadding implem
         }
     }
 
+    /**
+     * 恢复 Service 状态：从快照加载业务状态，调用 service.onStart()。
+     * <p>
+     * 这是 Service 启动的核心逻辑，负责：
+     * <ul>
+     *   <li>读取 Recovery State 计数器（ConsensusModule 创建）</li>
+     *   <li>从快照恢复业务状态（如果存在）</li>
+     *   <li>调用 service.onStart() 让业务逻辑完成初始化</li>
+     *   <li>向 ConsensusModule 发送就绪 ACK</li>
+     * </ul>
+     * <p>
+     * <b>Recovery State 计数器</b>：
+     * <pre>
+     * ConsensusModule 在启动时创建 Recovery State 计数器，包含：
+     * - logPosition: Service 应该从哪个位置开始消费日志
+     * - timestamp: 集群的当前时间
+     * - leadershipTermId: 当前 Leadership Term ID
+     * - snapshotRecordingId[]: 每个 Service 的快照 Recording ID（数组长度 = MAX_SERVICE_COUNT）
+     * </pre>
+     * <p>
+     * <b>执行流程</b>：
+     * <pre>
+     * 1. 等待 Recovery State 计数器就绪（ConsensusModule 创建）
+     * 2. 从计数器读取恢复信息：
+     *    ├─ logPosition（日志位置）
+     *    ├─ timestamp（集群时间）
+     *    ├─ leadershipTermId（Leadership Term ID）
+     *    └─ snapshotRecordingId（快照 Recording ID）
+     * 3. 加载快照（如果存在）：
+     *    ├─ 连接 AeronArchive
+     *    ├─ 开始回放快照（archive.startReplay()）
+     *    ├─ 从 Image 读取快照数据
+     *    │   ├─ 恢复会话列表（sessions）
+     *    │   └─ 恢复 timeUnit
+     *    └─ 调用 service.onStart(this, snapshotImage)
+     * 4. 发送就绪 ACK 给 ConsensusModule
+     * </pre>
+     *
+     * @param counters Aeron 计数器读取器
+     */
     private void recoverState(final CountersReader counters)
     {
+        // ==================== 步骤 1: 等待 Recovery State 计数器 ====================
+        // ConsensusModule 在启动时创建 Recovery State 计数器
+        // Service 需要等待其就绪才能开始恢复
         final int recoveryCounterId = awaitRecoveryCounter(counters);
+
+        // ==================== 步骤 2: 读取恢复信息 ====================
+
+        // 2.1 读取日志位置（Service 应该从哪个位置开始消费）
+        // - 如果是首次启动：logPosition = 0
+        // - 如果是重启：logPosition = 上次快照时的日志位置
         logPosition = RecoveryState.getLogPosition(counters, recoveryCounterId);
+
+        // 2.2 读取集群时间（用于时间戳）
         clusterTime = RecoveryState.getTimestamp(counters, recoveryCounterId);
+
+        // 2.3 读取 Leadership Term ID（用于消息头编码）
+        // - NULL_VALUE: 表示集群首次启动，没有历史数据
+        // - 非 NULL_VALUE: 表示集群重启，有历史快照
         final long leadershipTermId = RecoveryState.getLeadershipTermId(counters, recoveryCounterId);
         sessionMessageHeaderEncoder.leadershipTermId(leadershipTermId);
 
+        // ==================== 步骤 3: 调用 service.onStart() ====================
+        // activeLifecycleCallback 用于检测非法调用：
+        // - 在 onStart() 中不允许发送消息或调度定时器
         activeLifecycleCallback = LIFECYCLE_CALLBACK_ON_START;
         try
         {
-            if (NULL_VALUE != leadershipTermId)
+            if (NULL_VALUE != leadershipTermId)  // ← 有历史数据，需要加载快照
             {
+                // ==================== 步骤 3.1: 加载快照 ====================
+                // 从 Archive 加载快照并恢复状态：
+                // - 读取 snapshotRecordingId（每个 Service 有独立的快照）
+                // - 连接 AeronArchive，开始回放
+                // - 恢复会话列表（sessions）、timeUnit
+                // - 调用 service.onStart(this, snapshotImage)（业务逻辑恢复状态）
                 loadSnapshot(RecoveryState.getSnapshotRecordingId(counters, recoveryCounterId, serviceId));
             }
-            else
+            else  // ← 首次启动，没有快照
             {
+                // ==================== 步骤 3.2: 首次启动 ====================
+                // 直接调用 service.onStart(this, null)
+                // - null: 表示没有快照，业务逻辑需要从头初始化
                 service.onStart(this, null);
             }
         }
         finally
         {
+            // 恢复生命周期回调标志
             activeLifecycleCallback = LIFECYCLE_CALLBACK_NONE;
         }
 
+        // ==================== 步骤 4: 发送就绪 ACK 给 ConsensusModule ====================
+        // 通知 ConsensusModule：Service 已就绪，可以开始发送命令
+        // ACK 消息包含：
+        // - logPosition: Service 当前的日志位置
+        // - clusterTime: Service 当前的集群时间
+        // - ackId: 确认 ID（递增）
+        // - aeron.clientId(): Aeron 客户端 ID
+        // - serviceId: Service ID
         final long id = ackId++;
         while (!consensusModuleProxy.ack(logPosition, clusterTime, id, aeron.clientId(), serviceId))
         {
-            idle();
+            idle();  // ← 如果发送失败，重试（可能是 ConsensusModule 还未准备好）
         }
     }
 
@@ -961,35 +1224,132 @@ final class ClusteredServiceAgent extends ClusteredServiceAgentRhsPadding implem
         timeUnit = snapshotLoader.timeUnit();
     }
 
+    /**
+     * 执行快照保存：将集群状态和业务状态保存到 AeronArchive。
+     * <p>
+     * 这是快照保存的<b>核心方法</b>，负责：
+     * <ul>
+     *   <li>连接 AeronArchive（快照录制引擎）</li>
+     *   <li>创建快照 publication（用于写入快照数据）</li>
+     *   <li>录制快照到磁盘（零拷贝，高性能）</li>
+     *   <li>保存集群状态（会话列表）</li>
+     *   <li>调用业务逻辑保存自定义状态（service.onTakeSnapshot()）</li>
+     *   <li>等待录制完成并返回 recordingId</li>
+     * </ul>
+     * <p>
+     * <b>快照保存流程</b>：
+     * <pre>
+     * 1. 连接 AeronArchive（快照录制引擎）
+     * 2. 创建快照 publication（IPC 通道，高性能）
+     * 3. 开始录制快照到磁盘
+     *    - archive.startRecording() → 后台录制
+     *    - 使用零拷贝机制，不阻塞主线程
+     * 4. 等待录制计数器就绪
+     *    - RecordingPos 计数器用于跟踪录制进度
+     * 5. 保存快照内容
+     *    ├─ snapshotState() → 保存集群状态（会话列表）
+     *    └─ service.onTakeSnapshot() → 保存业务状态（自定义数据）
+     * 6. 等待录制完成
+     *    - 轮询 RecordingPos 计数器，等待所有数据写入磁盘
+     * 7. 返回 recordingId
+     *    - 用于恢复时定位快照文件
+     * </pre>
+     * <p>
+     * <b>重要特性</b>：
+     * <ul>
+     *   <li><b>非阻塞</b>：快照在后台录制，主线程继续处理消息</li>
+     *   <li><b>零拷贝</b>：使用 Aeron 零拷贝机制，高性能</li>
+     *   <li><b>原子性</b>：快照要么完全成功，要么失败（不会出现部分快照）</li>
+     *   <li><b>可恢复</b>：recordingId 用于恢复时定位快照文件</li>
+     * </ul>
+     * <p>
+     * <b>异常处理</b>：
+     * <ul>
+     *   <li>STORAGE_SPACE: 磁盘空间不足 → 终止 Agent（无法恢复）</li>
+     *   <li>其他异常：重新抛出，由调用者处理</li>
+     * </ul>
+     *
+     * @param logPosition 快照对应的日志位置（快照完成后，此位置之前的日志可以删除）
+     * @param leadershipTermId 当前 Leadership Term ID
+     * @return recordingId 快照的 Recording ID（用于恢复）
+     * @throws AgentTerminationException 磁盘空间不足
+     * @throws ArchiveException Archive 操作失败
+     */
     private long onTakeSnapshot(final long logPosition, final long leadershipTermId)
     {
+        // ==================== 步骤 1: 连接 AeronArchive 和创建快照 Publication ====================
+        // 使用 try-with-resources 确保资源正确关闭
+        // - AeronArchive: 快照录制引擎（负责将数据写入磁盘）
+        // - ExclusivePublication: 快照 publication（用于写入快照数据）
         try (AeronArchive archive = AeronArchive.connect(ctx.archiveContext().clone());
             ExclusivePublication publication = aeron.addExclusivePublication(
                 ctx.snapshotChannel(), ctx.snapshotStreamId()))
         {
+            // ==================== 步骤 2: 开始录制快照 ====================
+            // 将快照 publication 的所有消息录制到磁盘
+            // - channel: 添加 sessionId 以唯一标识此次录制
+            // - streamId: 快照流 ID（与日志流不同）
+            // - LOCAL: 本地录制（不需要网络传输）
+            // - true: 自动启动录制
             final String channel = ChannelUri.addSessionId(ctx.snapshotChannel(), publication.sessionId());
             archive.startRecording(channel, ctx.snapshotStreamId(), LOCAL, true);
+
+            // ==================== 步骤 3: 等待录制计数器就绪 ====================
+            // RecordingPos 计数器用于跟踪录制进度：
+            // - counterId: 计数器 ID
+            // - recordingId: 快照的 Recording ID（用于恢复）
             final CountersReader counters = aeron.countersReader();
             final int counterId = awaitRecordingCounter(publication.sessionId(), counters, archive);
             final long recordingId = RecordingPos.getRecordingId(counters, counterId);
 
+            // ==================== 步骤 4: 保存集群状态（会话列表） ====================
+            // snapshotState() 会保存：
+            // - 快照元数据（BEGIN）
+            // - 所有客户端会话（sessions）
+            // - 快照元数据（END）
             snapshotState(publication, logPosition, leadershipTermId);
+
+            // 检查时钟 tick（更新活跃时间戳）
             checkForClockTick(nanoClock.nanoTime());
+
+            // 检查 Archive 是否有错误响应
             archive.checkForErrorResponse();
 
+            // ==================== 步骤 5: 调用业务逻辑保存自定义状态 ====================
+            // service.onTakeSnapshot() 由业务逻辑实现：
+            // - 保存业务状态（如 counter、orders、users 等）
+            // - 通过 publication.offer() 写入快照数据
+            // - 数据会自动录制到磁盘（Archive 后台录制）
+            // <p>
+            // <b>重要</b>：这是非阻塞的！
+            // - publication.offer() 立即返回，不等待数据写入磁盘
+            // - Archive 在后台将数据写入磁盘
+            // - 主线程继续执行，不会被阻塞
             service.onTakeSnapshot(publication);
 
+            // ==================== 步骤 6: 等待录制完成 ====================
+            // 轮询 RecordingPos 计数器，等待所有数据写入磁盘
+            // - position: publication 的当前位置（总共写入的字节数）
+            // - counters.getCounterValue(counterId): 已录制的字节数
+            // - 当 已录制字节数 >= 总字节数 时，录制完成
             awaitRecordingComplete(recordingId, publication.position(), counters, counterId, archive);
 
+            // ==================== 返回 recordingId ====================
+            // recordingId 用于恢复时定位快照文件
+            // - ConsensusModule 会记录此 recordingId
+            // - 重启时，从 RecoveryState 读取 recordingId，加载快照
             return recordingId;
         }
         catch (final ArchiveException ex)
         {
+            // ==================== 异常处理：磁盘空间不足 ====================
+            // 如果磁盘空间不足，无法继续运行，终止 Agent
             if (ex.errorCode() == ArchiveException.STORAGE_SPACE)
             {
                 throw new AgentTerminationException(ex);
             }
 
+            // 其他异常：重新抛出
             throw ex;
         }
     }
@@ -1014,19 +1374,98 @@ final class ClusteredServiceAgent extends ClusteredServiceAgentRhsPadding implem
         }
     }
 
+    /**
+     * 保存集群状态到快照：写入快照元数据和会话列表。
+     * <p>
+     * 这是保存集群状态的核心方法，负责：
+     * <ul>
+     *   <li>写入快照元数据（BEGIN）：logPosition、leadershipTermId、timeUnit、appVersion</li>
+     *   <li>写入所有客户端会话：clusterSessionId、responseChannel、encodedPrincipal 等</li>
+     *   <li>写入快照元数据（END）：与 BEGIN 相同，用于校验完整性</li>
+     * </ul>
+     * <p>
+     * <b>快照内容结构</b>：
+     * <pre>
+     * ┌─────────────────────────────────────────────────────┐
+     * │  SnapshotMark (BEGIN)                               │
+     * │  - snapshotTypeId: SNAPSHOT_TYPE_ID (2)             │
+     * │  - logPosition: 快照对应的日志位置                   │
+     * │  - leadershipTermId: 当前 Term ID                    │
+     * │  - index: 0 (快照索引，保留字段)                     │
+     * │  - timeUnit: 集群时间单位 (MILLISECONDS/...)         │
+     * │  - appVersion: 应用版本号 (如 1.2.3 → 0x01020300)    │
+     * ├─────────────────────────────────────────────────────┤
+     * │  ClientSession[] (所有客户端会话)                    │
+     * │  - clusterSessionId: 100                            │
+     * │  - correlationId: 关联 ID                           │
+     * │  - openedLogPosition: 会话打开时的日志位置           │
+     * │  - closedLogPosition: 会话关闭时的日志位置（未关闭则为 NULL）│
+     * │  - responseStreamId: 响应通道 stream ID             │
+     * │  - responseChannel: 响应通道 URL                    │
+     * │  - encodedPrincipal: 认证凭证（序列化的用户信息）    │
+     * │                                                     │
+     * │  - clusterSessionId: 101                            │
+     * │  - ...                                              │
+     * ├─────────────────────────────────────────────────────┤
+     * │  SnapshotMark (END)                                 │
+     * │  - 与 BEGIN 相同的数据（用于校验快照完整性）         │
+     * └─────────────────────────────────────────────────────┘
+     * </pre>
+     * <p>
+     * <b>注意</b>：业务状态由 service.onTakeSnapshot() 单独写入，不在此方法中。
+     *
+     * @param publication 快照 publication（用于写入快照数据）
+     * @param logPosition 快照对应的日志位置
+     * @param leadershipTermId 当前 Leadership Term ID
+     */
     private void snapshotState(
         final ExclusivePublication publication, final long logPosition, final long leadershipTermId)
     {
+        // ==================== 创建快照保存器 ====================
+        // ServiceSnapshotTaker 是快照保存的工具类：
+        // - publication: 快照 publication（用于写入数据）
+        // - idleStrategy: 空闲策略（写入失败时降低 CPU 占用）
+        // - aeronAgentInvoker: Aeron 代理调用器（用于手动驱动）
         final ServiceSnapshotTaker snapshotTaker = new ServiceSnapshotTaker(
             publication, idleStrategy, aeronAgentInvoker);
 
+        // ==================== 步骤 1: 写入快照元数据（BEGIN） ====================
+        // markBegin() 会写入快照的开始标记，包含：
+        // - SNAPSHOT_TYPE_ID (2): 快照类型 ID（区分不同类型的快照）
+        // - logPosition: 快照对应的日志位置
+        //   - 快照完成后，logPosition 之前的日志可以删除
+        //   - 恢复时，从 logPosition 开始回放日志
+        // - leadershipTermId: 当前 Leadership Term ID
+        //   - 用于校验快照是否来自当前 Term
+        // - 0: 快照索引（保留字段，当前未使用）
+        // - timeUnit: 集群时间单位（MILLISECONDS/MICROSECONDS/NANOSECONDS）
+        //   - 所有节点使用相同的时间单位
+        // - ctx.appVersion(): 应用版本号
+        //   - 用于兼容性检查（防止不兼容的版本加载快照）
         snapshotTaker.markBegin(SNAPSHOT_TYPE_ID, logPosition, leadershipTermId, 0, timeUnit, ctx.appVersion());
 
+        // ==================== 步骤 2: 写入所有客户端会话 ====================
+        // 遍历所有活跃会话，将每个会话的信息写入快照：
+        // - clusterSessionId: 会话 ID（全局唯一）
+        // - correlationId: 关联 ID（客户端连接请求的关联 ID）
+        // - openedLogPosition: 会话打开时的日志位置
+        // - closedLogPosition: 会话关闭时的日志位置（未关闭则为 NULL）
+        // - responseStreamId: 响应通道的 stream ID
+        // - responseChannel: 响应通道的 URL（如 "aeron:udp?endpoint=localhost:20001"）
+        // - encodedPrincipal: 认证凭证（序列化的用户信息）
+        // <p>
+        // 恢复时，会根据这些信息重建会话对象：
+        // - Leader: 重新连接响应通道，准备向客户端发送响应
+        // - Follower: 只创建会话对象，不连接（Follower 不发送响应）
         for (int i = 0, size = sessions.size(); i < size; i++)
         {
             snapshotTaker.snapshotSession(sessions.get(i));
         }
 
+        // ==================== 步骤 3: 写入快照元数据（END） ====================
+        // markEnd() 会写入快照的结束标记，包含与 BEGIN 相同的数据：
+        // - 用于校验快照完整性（BEGIN 和 END 必须一致）
+        // - 如果不一致，说明快照损坏，恢复时会失败
         snapshotTaker.markEnd(SNAPSHOT_TYPE_ID, logPosition, leadershipTermId, 0, timeUnit, ctx.appVersion());
     }
 

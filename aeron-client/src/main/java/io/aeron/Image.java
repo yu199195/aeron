@@ -336,56 +336,65 @@ public final class Image
      */
     public int poll(final FragmentHandler fragmentHandler, final int fragmentLimit)
     {
-        if (isClosed)
+        if (isClosed)                                                   // 快速检查：Image 若已关闭，直接返回 0，不做任何读取
         {
             return 0;
         }
 
-        int fragmentsRead = 0;
-        final long initialPosition = subscriberPosition.get();   // 当前已消费到的 position
-        final int initialOffset = (int)initialPosition & termLengthMask;
-        int offset = initialOffset;
-        final UnsafeBuffer termBuffer = activeTermBuffer(initialPosition);  // 根据 position 选当前 term
-        final int capacity = termBuffer.capacity();
-        final Header header = this.header;
-        header.buffer(termBuffer);
+        int fragmentsRead = 0;                                         // 本次 poll 已读取的 fragment 计数（不含 padding 帧）
+        final long initialPosition = subscriberPosition.get();          // 读取当前 subscriberPosition：已消费到的绝对字节位置
+                                                                        //   subscriberPosition 由消费者推进，Driver 通过它计算流控窗口
+        final int initialOffset = (int)initialPosition & termLengthMask;// 取 position 的低位得到 term 内偏移（等效 position % termLength）
+        int offset = initialOffset;                                     // offset 作为本次扫描的游标，从 initialOffset 开始向后推进
+        final UnsafeBuffer termBuffer = activeTermBuffer(initialPosition);  // 根据 position 计算当前活跃的 term buffer 下标并取出
+                                                                        //   实现: termBuffers[indexByPosition(position, positionBitsToShift)]
+        final int capacity = termBuffer.capacity();                     // 当前 term buffer 的总容量（即 termLength）
+        final Header header = this.header;                              // 复用 Image 级别的 Header 对象（避免每帧分配），带 termId/sessionId 等元数据
+        header.buffer(termBuffer);                                      // 将 header 绑定到当前 termBuffer，后续 header.offset() 即可定位帧头
 
         try
         {
-            while (fragmentsRead < fragmentLimit && offset < capacity && !isClosed)
+            while (fragmentsRead < fragmentLimit && offset < capacity && !isClosed)     // 循环条件：未达到 fragment 上限、未扫到 term 尾、Image 未关闭
             {
-                final int frameLength = frameLengthVolatile(termBuffer, offset);
-                if (frameLength <= 0)
+                final int frameLength = frameLengthVolatile(termBuffer, offset);        // volatile 读帧头第一个 int → frameLength
+                                                                        //   > 0：帧已完全写入可读 | <= 0：帧尚未完成（发送者还在写）或 term 已到末尾
+                if (frameLength <= 0)                                   // frameLength <= 0 说明到达"写入前沿"（writer 尚未完成此帧），退出循环
                 {
-                    break;  // 尚未写入完成或到 term 末
+                    break;
                 }
 
-                final int frameOffset = offset;
-                offset += BitUtil.align(frameLength, FRAME_ALIGNMENT);
+                final int frameOffset = offset;                         // 记录当前帧起始偏移（用于后续回调与 padding 判断）
+                offset += BitUtil.align(frameLength, FRAME_ALIGNMENT);  // 游标推进到下一帧：按 FRAME_ALIGNMENT(32 字节) 对齐后的帧长
 
-                if (!isPaddingFrame(termBuffer, frameOffset))
+                if (!isPaddingFrame(termBuffer, frameOffset))           // 判断是否为 padding 帧（term 末尾填充，type=PADDING_FRAME_TYPE）
                 {
-                    ++fragmentsRead;
-                    header.offset(frameOffset);
-                    fragmentHandler.onFragment(
-                        termBuffer, frameOffset + HEADER_LENGTH, frameLength - HEADER_LENGTH, header);
+                    ++fragmentsRead;                                    // 非 padding → 有效 data fragment，计数 +1
+                    header.offset(frameOffset);                         // 设置 header 偏移，使 header.position() 等方法可正确计算
+                    fragmentHandler.onFragment(                         // 回调用户的 FragmentHandler：
+                        termBuffer,                                     //   buffer  = 当前 term buffer
+                        frameOffset + HEADER_LENGTH,                    //   offset  = 跳过 32 字节帧头后的 payload 起始位置
+                        frameLength - HEADER_LENGTH,                    //   length  = payload 长度 = 帧总长 - 帧头长度
+                        header);                                        //   header  = 帧元数据（可通过它获取 sessionId, termId, position 等）
                 }
+                // padding 帧：仅推进 offset 游标跳过，不计入 fragmentsRead，不回调 handler
             }
         }
-        catch (final Exception ex)
+        catch (final Exception ex)                                      // 捕获 handler 回调中抛出的异常，防止异常逃逸导致 position 不推进
         {
-            errorHandler.onError(ex);
+            errorHandler.onError(ex);                                   // 交给 errorHandler 处理（默认打印日志或计数）
         }
-        finally
+        finally                                                         // 无论成功还是异常，都尝试推进 subscriberPosition
         {
-            final long newPosition = initialPosition + (offset - initialOffset);
-            if (newPosition > initialPosition && !isClosed)
+            final long newPosition = initialPosition + (offset - initialOffset);    // 新 position = 旧 position + 本次扫描推进的字节数
+            if (newPosition > initialPosition && !isClosed)             // 若确实读到了数据（position 前进了）且 Image 未关闭
             {
-                subscriberPosition.setRelease(newPosition);  // 推进消费位，Driver 据此更新 flow control
+                subscriberPosition.setRelease(newPosition);             // 以 release 语义推进 subscriberPosition → Driver 据此更新流控窗口
+                                                                        //   Driver 的 flow control 会读取此 position，调整 positionLimit
+                                                                        //   从而允许 Publisher 继续写入更多数据（解除背压）
             }
         }
 
-        return fragmentsRead;
+        return fragmentsRead;                                           // 返回本次消费的有效 fragment 数量
     }
 
     /**

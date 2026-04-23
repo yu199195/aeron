@@ -119,14 +119,24 @@ public final class ControlTransportPoller extends UdpTransportPoller
     }
 
     /**
-     * Register channel for read.
+     * 【将 UDP Socket 注册到 NIO Selector 监听读事件】
+     * <p>
+     * 在 Sender 线程中被调用（通过 SenderProxy → Sender.onRegisterSendChannelEndpoint）。
+     * 将发送端的 receiveDatagramChannel 注册到 Selector 上监听 OP_READ 事件，
+     * 用于接收来自远端接收者的控制消息（Status Message / NAK）。
+     * <p>
+     * 注意：虽然这是"发送端"的 endpoint，但它也需要接收控制消息：
+     * - Status Message (SM)：接收端定期发送，携带 receiver window 信息供流控使用
+     * - NAK：接收端检测到丢包时发送，触发发送端重传
      *
-     * @param sendChannelEndpoint to associate with read.
+     * @param sendChannelEndpoint 要注册的发送端 endpoint
      */
     public void registerForRead(final SendChannelEndpoint sendChannelEndpoint)
     {
         try
         {
+            // 将 DatagramChannel 注册到 Selector，关注 OP_READ 事件
+            // attachment 设为 endpoint 本身，poll 到数据时可直接定位到对应的 endpoint 处理
             final SelectionKey key = sendChannelEndpoint.receiveDatagramChannel()
                 .register(selector, SelectionKey.OP_READ, sendChannelEndpoint);
             transports.add(new Transport(sendChannelEndpoint, key));

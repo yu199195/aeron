@@ -22,8 +22,19 @@ import org.agrona.concurrent.status.CountersManager;
 import java.net.InetSocketAddress;
 
 /**
- * Congestion control algorithm which uses the min of {@link MediaDriver.Context#initialWindowLength()} or half a term
- * length as a static window.
+ * 【源码解析】StaticWindowCongestionControl —— 固定窗口拥塞控制（Aeron 默认策略）。
+ * <p>
+ * 算法极简：在初始化时计算一个固定的 receiverWindowLength，此后永远返回该值。
+ * windowLength = min(initialWindowLength, termLength / 2)
+ * <p>
+ * 特点：
+ * - 不根据 RTT、丢包率等网络状态动态调整窗口
+ * - 不测量 RTT（shouldMeasureRtt() 返回 false）
+ * - 适用于低延迟、网络条件可控的场景（如数据中心内部）
+ * <p>
+ * 对比 CubicCongestionControl（可选策略）：
+ * - Cubic 会根据 RTT 和丢包动态调整窗口（类 TCP CUBIC）
+ * - 适用于广域网或网络条件不可控的场景
  */
 public class StaticWindowCongestionControl implements CongestionControl
 {

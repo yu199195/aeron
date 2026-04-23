@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="io.aeron.samples.cluster.sbe"
+                   id="1"
+                   version="0"
+                   semanticVersion="1.0.0"
+                   description="Messaging Schema"
+                   byteOrder="littleEndian">
+    <types>
+        <composite name="messageHeader" description="Message identifiers and length of message root">
+            <type name="blockLength" primitiveType="uint16"/>
+            <type name="templateId" primitiveType="uint16"/>
+            <type name="schemaId" primitiveType="uint16"/>
+            <type name="version" primitiveType="uint16"/>
+        </composite>
+        <composite name="varStringEncoding" description="Variable length UTF-8 encoded string">
+            <type name="length" primitiveType="uint32" maxValue="1073741824"/>
+            <type name="varData" primitiveType="uint8" length="0" characterEncoding="UTF-8"/>
+        </composite>
+    </types>
+
+    <!-- Order 消息 -->
+    <sbe:message name="Order" id="1" description="Order Message">
+        <field name="orderId" id="1" type="int64" description="Order ID"/>
+        <field name="price" id="2" type="int64" description="Price (scaled by 100)"/>
+        <field name="quantity" id="3" type="int32" description="Quantity"/>
+        <field name="side" id="4" type="char" description="Side (B=Buy, S=Sell)"/>
+        <field name="timestamp" id="5" type="int64" description="Timestamp (milliseconds)"/>
+        <data name="symbol" id="6" type="varStringEncoding" description="Symbol"/>
+    </sbe:message>
+
+    <!-- User 消息 -->
+    <sbe:message name="User" id="2" description="User Message">
+        <field name="userId" id="1" type="int64" description="User ID"/>
+        <field name="age" id="2" type="int32" description="Age"/>
+        <field name="balance" id="3" type="int64" description="Balance (cents)"/>
+        <field name="isActive" id="4" type="uint8" description="Active flag (0=false, 1=true)"/>
+        <data name="username" id="5" type="varStringEncoding" description="Username"/>
+        <data name="email" id="6" type="varStringEncoding" description="Email"/>
+    </sbe:message>
+</sbe:messageSchema>
