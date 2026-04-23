@@ -45,6 +45,8 @@ import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.ClusterException;
 import io.aeron.cluster.client.ControlledEgressListener;
 import io.aeron.cluster.client.EgressListener;
+import io.aeron.cluster.codecs.BackupQueryEncoder;
+import io.aeron.cluster.codecs.BackupResponseDecoder;
 import io.aeron.cluster.codecs.EventCode;
 import io.aeron.cluster.codecs.MessageHeaderDecoder;
 import io.aeron.cluster.codecs.MessageHeaderEncoder;
@@ -83,6 +85,7 @@ import org.agrona.collections.IntHashSet;
 import org.agrona.collections.MutableBoolean;
 import org.agrona.collections.MutableInteger;
 import org.agrona.collections.MutableLong;
+import org.agrona.collections.Object2ObjectHashMap;
 import org.agrona.concurrent.AgentInvoker;
 import org.agrona.concurrent.EpochClock;
 import org.agrona.concurrent.NoOpLock;
@@ -95,8 +98,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
@@ -110,6 +115,7 @@ import java.util.stream.Stream;
 
 import static io.aeron.Aeron.NULL_VALUE;
 import static io.aeron.archive.client.AeronArchive.NULL_POSITION;
+import static io.aeron.cluster.ConsensusModule.Configuration.SERVICE_ID;
 import static io.aeron.cluster.service.Cluster.Role.FOLLOWER;
 import static io.aeron.test.cluster.ClusterTests.LARGE_MSG;
 import static io.aeron.test.cluster.ClusterTests.PAUSE;
@@ -168,6 +174,7 @@ public final class TestCluster implements AutoCloseable
     private final int clusterId;
     private final IntFunction<TestNode.TestService[]> serviceSupplier;
     private final boolean useResponseChannels;
+    private final Map<TestNode, BackupQueryRunner> backQueryRunners = new Object2ObjectHashMap<>();
 
     private long leaderHeartbeatTimeoutNs;
     private long leaderHeartbeatIntervalNs;
@@ -365,6 +372,8 @@ public final class TestCluster implements AutoCloseable
         final boolean isInterrupted = Thread.interrupted();
         try
         {
+            backQueryRunners.values().forEach(CloseHelper::close);
+
             CloseHelper.closeAll(
                 client,
                 clientMediaDriver,
@@ -1877,8 +1886,7 @@ public final class TestCluster implements AutoCloseable
 
         final RecordingDescriptorCollector collector = new RecordingDescriptorCollector(10);
         final RecordingLog recordingLog = new RecordingLog(node.consensusModule().context().clusterDir(), false);
-        final RecordingLog.Entry latestSnapshot = requireNonNull(
-            recordingLog.getLatestSnapshot(ConsensusModule.Configuration.SERVICE_ID));
+        final RecordingLog.Entry latestSnapshot = requireNonNull(recordingLog.getLatestSnapshot(SERVICE_ID));
         final long recordingId = recordingLog.findLastTermRecordingId();
         if (RecordingPos.NULL_RECORDING_ID == recordingId)
         {
@@ -2307,6 +2315,147 @@ public final class TestCluster implements AutoCloseable
             {
                 node.service().failNextSnapshot(failNextSnapshot);
             }
+        }
+    }
+
+    public void backupQueryContainsSnapshot(
+        final TestNode leader,
+        final long logPosition,
+        final SnapshotRecord snapshotRecord)
+    {
+        final BackupQueryRunner backupQueryRunner = backQueryRunners.computeIfAbsent(leader, BackupQueryRunner::new);
+        backupQueryRunner.run(logPosition, snapshotRecord);
+    }
+
+    private class BackupQueryRunner implements AutoCloseable
+    {
+        private final ExpandableArrayBuffer expandableArrayBuffer = new ExpandableArrayBuffer(128);
+        private final MessageHeaderEncoder headerEncoder = new MessageHeaderEncoder();
+        private final BackupQueryEncoder backupQueryEncoder = new BackupQueryEncoder();
+        private final MessageHeaderDecoder headerDecoder = new MessageHeaderDecoder();
+        private final BackupResponseDecoder backupResponseDecoder = new BackupResponseDecoder();
+
+        private final Subscription subscription;
+        private final Publication publication;
+        private final String responseChannel;
+        private final Aeron aeron;
+
+        BackupQueryRunner(final TestNode node)
+        {
+            final String channel = new ChannelUriStringBuilder()
+                .media("udp")
+                .endpoint(clusterConsensusEndpoints(node.memberId(), node.memberId() + 1))
+                .termLength(64 * 1024)
+                .build();
+
+            final int streamId = ConsensusModule.Configuration.consensusStreamId();
+            final int responseStreamId = 29876;
+
+            aeron = client.context().aeron();
+            subscription = aeron.addSubscription("aeron:udp?endpoint=localhost:0", responseStreamId);
+            publication = aeron.addPublication(channel, streamId);
+
+            List<String> socketAddresses;
+            do
+            {
+                socketAddresses = subscription.localSocketAddresses();
+                if (!socketAddresses.isEmpty())
+                {
+                    break;
+                }
+                Tests.yield();
+            }
+            while (true);
+
+            responseChannel = "aeron:udp?endpoint=" + socketAddresses.get(0);
+        }
+
+        void run(final long logPosition, final SnapshotRecord snapshotRecord)
+        {
+            final long correlationId = aeron.nextCorrelationId();
+
+            backupQueryEncoder.wrapAndApplyHeader(expandableArrayBuffer, 0, headerEncoder)
+                .correlationId(correlationId)
+                .responseStreamId(subscription.streamId())
+                .version(AeronCluster.Configuration.PROTOCOL_SEMANTIC_VERSION)
+                .logPosition(logPosition)
+                .responseChannel(responseChannel);
+
+            final int requestLength = headerEncoder.encodedLength() + backupQueryEncoder.encodedLength();
+            while (publication.offer(expandableArrayBuffer, 0, requestLength) < 0)
+            {
+                Tests.yield();
+            }
+
+            final MutableBoolean found = new MutableBoolean(false);
+            final MutableBoolean matches = new MutableBoolean(false);
+
+            final FragmentHandler handler = (buffer, offset, length, header) ->
+            {
+                if (length < MessageHeaderDecoder.ENCODED_LENGTH)
+                {
+                    return;
+                }
+
+                headerDecoder.wrap(buffer, offset);
+
+                if (headerDecoder.templateId() != backupResponseDecoder.sbeTemplateId())
+                {
+                    return;
+                }
+
+                backupResponseDecoder.wrapAndApplyHeader(buffer, offset, headerDecoder);
+
+                if (correlationId != backupResponseDecoder.correlationId())
+                {
+                    return;
+                }
+
+                found.set(true);
+
+                final BackupResponseDecoder.SnapshotsDecoder snapshots = backupResponseDecoder.snapshots();
+                boolean hasMatch = (0 < snapshots.count());
+                while (snapshots.hasNext())
+                {
+                    final BackupResponseDecoder.SnapshotsDecoder next = snapshots.next();
+                    hasMatch &= next.logPosition() == snapshotRecord.logPosition();
+                }
+
+                matches.set(hasMatch);
+            };
+
+            while (!found.get())
+            {
+                final int fragments = subscription.poll(handler, 10);
+                if (0 == fragments)
+                {
+                    Tests.yield();
+                }
+            }
+
+            assertTrue(matches.get());
+        }
+
+        public void close()
+        {
+            CloseHelper.quietCloseAll(subscription, publication);
+        }
+    }
+
+    public record SnapshotRecord(long recordingId, long logPosition)
+    {
+    }
+
+    public List<SnapshotRecord> snapshots(final TestNode testNode)
+    {
+        final File file = testNode.consensusModule().context().clusterDir();
+        try (RecordingLog recordingLog = new RecordingLog(file, false))
+        {
+            return recordingLog.entries().stream()
+                .filter((entry) -> RecordingLog.ENTRY_TYPE_SNAPSHOT == entry.type && SERVICE_ID == entry.serviceId)
+                .map(entry -> new SnapshotRecord(entry.recordingId, entry.logPosition))
+                .sorted(Comparator.comparingLong(SnapshotRecord::logPosition))
+                .toList();
         }
     }
 

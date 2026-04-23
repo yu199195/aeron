@@ -15,6 +15,7 @@
  */
 package io.aeron.cluster;
 
+import io.aeron.Aeron;
 import io.aeron.CommonContext;
 import io.aeron.ExclusivePublication;
 import io.aeron.Publication;
@@ -456,16 +457,39 @@ final class ConsensusPublisher
         final String responseChannel,
         final byte[] encodedCredentials)
     {
+        return backupQuery(
+            publication,
+            correlationId,
+            responseStreamId,
+            version,
+            Aeron.NULL_VALUE,
+            responseChannel,
+            encodedCredentials);
+    }
+
+    boolean backupQuery(
+        final ExclusivePublication publication,
+        final long correlationId,
+        final int responseStreamId,
+        final int version,
+        final long logPosition,
+        final String responseChannel,
+        final byte[] encodedCredentials)
+    {
         if (null == publication)
         {
             return false;
         }
+
+        final long logPositionValue = Aeron.NULL_VALUE != logPosition ? logPosition :
+            BackupQueryEncoder.logPositionNullValue();
 
         backupQueryEncoder
             .wrapAndApplyHeader(buffer, 0, messageHeaderEncoder)
             .correlationId(correlationId)
             .responseStreamId(responseStreamId)
             .version(version)
+            .logPosition(logPositionValue)
             .responseChannel(responseChannel)
             .putEncodedCredentials(encodedCredentials, 0, encodedCredentials.length);
 
@@ -480,7 +504,8 @@ final class ConsensusPublisher
         final int memberId,
         final RecordingLog.Entry lastEntry,
         final RecordingLog.RecoveryPlan recoveryPlan,
-        final String clusterMembers)
+        final String clusterMembers,
+        final List<RecordingLog.Snapshot> snapshots)
     {
         backupResponseEncoder.wrapAndApplyHeader(buffer, 0, messageHeaderEncoder)
             .correlationId(session.correlationId())
@@ -493,11 +518,13 @@ final class ConsensusPublisher
             .leaderMemberId(leaderMemberId)
             .memberId(memberId);
 
+        final List<RecordingLog.Snapshot> snapshotList = null == snapshots ? List.of() : snapshots;
+
         final BackupResponseEncoder.SnapshotsEncoder snapshotsEncoder =
-            backupResponseEncoder.snapshotsCount(recoveryPlan.snapshots().size());
-        for (int i = 0, length = recoveryPlan.snapshots().size(); i < length; i++)
+            backupResponseEncoder.snapshotsCount(snapshotList.size());
+        for (int i = 0, length = snapshotList.size(); i < length; i++)
         {
-            final RecordingLog.Snapshot snapshot = recoveryPlan.snapshots().get(i);
+            final RecordingLog.Snapshot snapshot = snapshotList.get(i);
 
             snapshotsEncoder.next()
                 .recordingId(snapshot.recordingId())

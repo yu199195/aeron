@@ -38,6 +38,7 @@ import java.util.*;
 
 import static io.aeron.Aeron.NULL_VALUE;
 import static io.aeron.archive.client.AeronArchive.NULL_POSITION;
+import static io.aeron.cluster.ConsensusModule.Configuration.SERVICE_ID;
 import static java.lang.Math.max;
 import static java.nio.ByteOrder.LITTLE_ENDIAN;
 import static java.nio.file.StandardOpenOption.*;
@@ -767,9 +768,9 @@ public final class RecordingLog implements AutoCloseable
         for (int i = entriesCache.size() - 1; i >= 0; i--)
         {
             final Entry entry = entriesCache.get(i);
-            if (isValidSnapshot(entry) && ConsensusModule.Configuration.SERVICE_ID == entry.serviceId)
+            if (isValidSnapshot(entry) && SERVICE_ID == entry.serviceId)
             {
-                if (ConsensusModule.Configuration.SERVICE_ID == serviceId)
+                if (SERVICE_ID == serviceId)
                 {
                     return entry;
                 }
@@ -802,7 +803,7 @@ public final class RecordingLog implements AutoCloseable
         for (int idx = entriesCache.size() - 1; idx >= 0; idx--)
         {
             final Entry entry = entriesCache.get(idx);
-            if (isValidAnySnapshot(entry) && ConsensusModule.Configuration.SERVICE_ID == entry.serviceId)
+            if (isValidAnySnapshot(entry) && SERVICE_ID == entry.serviceId)
             {
                 if (entry.logPosition >= highLogPosition)
                 {
@@ -834,7 +835,7 @@ public final class RecordingLog implements AutoCloseable
         {
             final int startingIndex = indices.popInt();
 
-            int serviceId = ConsensusModule.Configuration.SERVICE_ID;
+            int serviceId = SERVICE_ID;
 
             for (int idx = startingIndex; idx >= 0; idx--)
             {
@@ -1187,7 +1188,81 @@ public final class RecordingLog implements AutoCloseable
         return latestStandbySnapshots;
     }
 
+    List<Snapshot> findSnapshotAtOrBeforeOrLowest(final long logPosition, final int serviceCount)
+    {
+        entriesCache.sort(ENTRY_COMPARATOR);
 
+        for (int i = entriesCache.size() - 1; i >= 0; i--)
+        {
+            final Entry entry = entriesCache.get(i);
+            if (isValidSnapshot(entry) && SERVICE_ID == entry.serviceId)
+            {
+                if (entry.logPosition > logPosition)
+                {
+                    continue;
+                }
+
+                if (validateSnapshotEntries(entriesCache, serviceCount, i, entry))
+                {
+                    return convertEntryListToSnapshotList(entriesCache.subList(i - serviceCount, i + 1));
+                }
+            }
+        }
+
+        for (int i = 0; i < entriesCache.size(); i++)
+        {
+            final Entry entry = entriesCache.get(i);
+            if (isValidSnapshot(entry) && SERVICE_ID == entry.serviceId)
+            {
+                if (validateSnapshotEntries(entriesCache, serviceCount, i, entry))
+                {
+                    return convertEntryListToSnapshotList(entriesCache.subList(i - serviceCount, i + 1));
+                }
+            }
+        }
+
+        return null;
+    }
+
+    static List<Snapshot> convertEntryListToSnapshotList(final List<Entry> entries)
+    {
+        final List<Snapshot> snapshots = new ArrayList<>(entries.size());
+
+        for (int i = 0; i < entries.size(); i++)
+        {
+            final Entry entry = entries.get(i);
+            snapshots.add(new Snapshot(
+                entry.recordingId,
+                entry.leadershipTermId,
+                entry.termBaseLogPosition,
+                entry.logPosition,
+                entry.timestamp,
+                entry.serviceId));
+        }
+
+        return snapshots;
+    }
+
+    static boolean validateSnapshotEntries(
+        final ArrayList<Entry> entries,
+        final int serviceCount,
+        final int snapshotIndex,
+        final Entry consensusModuleEntry)
+    {
+        for (int i = 1; i <= serviceCount; i++)
+        {
+            final Entry entry = entries.get(snapshotIndex - i);
+
+            if (ENTRY_TYPE_SNAPSHOT != entry.type ||
+                entry.leadershipTermId != consensusModuleEntry.leadershipTermId ||
+                entry.logPosition != consensusModuleEntry.logPosition)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     /**
      * {@inheritDoc}
@@ -1650,7 +1725,7 @@ public final class RecordingLog implements AutoCloseable
         {
             final Entry entry = entries.get(i);
             if (-1 == snapshotIndex && isValidSnapshot(entry) &&
-                entry.serviceId == ConsensusModule.Configuration.SERVICE_ID)
+                entry.serviceId == SERVICE_ID)
             {
                 snapshotIndex = i;
             }

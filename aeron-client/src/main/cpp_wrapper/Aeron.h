@@ -91,15 +91,40 @@ public:
 
     ~Aeron()
     {
+        std::lock_guard<std::recursive_mutex> lock(m_adminLock);
+
         aeron_on_close_client_pair_t closePair = {emptyCallback, nullptr};
         aeron_add_close_handler(m_aeron, &closePair);
         aeron_close(m_aeron);
+        aeron_context_close(m_aeron_context);
+
+        for (const std::pair<const std::int64_t, AsyncAddCounter *>& e : m_pendingCounters)
+        {
+            aeron_async_cmd_free(e.second);
+        }
+
+        for (const std::pair<const std::int64_t, AsyncAddPublication *>& e : m_pendingPublications)
+        {
+            aeron_async_cmd_free(e.second);
+        }
+
+        for (const std::pair<const std::int64_t, AsyncAddExclusivePublication *>& e : m_pendingExclusivePublications)
+        {
+            aeron_async_cmd_free(e.second);
+        }
+
+        for (const std::pair<const std::int64_t, AsyncAddSubscription *>& e : m_pendingSubscriptions)
+        {
+            delete e.second;
+        }
 
         m_availableCounterHandlers.clear();
         m_unavailableCounterHandlers.clear();
         m_closeClientHandlers.clear();
-
-        aeron_context_close(m_aeron_context);
+        m_pendingCounters.clear();
+        m_pendingPublications.clear();
+        m_pendingExclusivePublications.clear();
+        m_pendingSubscriptions.clear();
     }
 
     /**
@@ -184,16 +209,24 @@ public:
         auto search = m_pendingPublications.find(registrationId);
         if (search == m_pendingPublications.end())
         {
-            throw IllegalArgumentException("Unknown registration id", SOURCEINFO);
+            throw IllegalArgumentException(
+                std::string("Unknown registration id: ").append(std::to_string(registrationId)), SOURCEINFO);
         }
 
-        std::shared_ptr<Publication> publication = findPublication(search->second);
-        if (nullptr != publication)
+        try
+        {
+            std::shared_ptr<Publication> publication = findPublication(search->second);
+            if (nullptr != publication)
+            {
+                m_pendingPublications.erase(registrationId);
+            }
+            return publication;
+        }
+        catch (...)
         {
             m_pendingPublications.erase(registrationId);
+            throw;
         }
-
-        return publication;
     }
 
     /**
@@ -310,16 +343,24 @@ public:
         auto search = m_pendingExclusivePublications.find(registrationId);
         if (search == m_pendingExclusivePublications.end())
         {
-            throw IllegalArgumentException("Unknown registration id", SOURCEINFO);
+            throw IllegalArgumentException(
+                std::string("Unknown registration id: ").append(std::to_string(registrationId)), SOURCEINFO);
         }
 
-        std::shared_ptr<ExclusivePublication> publication = findExclusivePublication(search->second);
-        if (nullptr != publication)
+        try
+        {
+            std::shared_ptr<ExclusivePublication> publication = findExclusivePublication(search->second);
+            if (nullptr != publication)
+            {
+                m_pendingExclusivePublications.erase(registrationId);
+            }
+            return publication;
+        }
+        catch (...)
         {
             m_pendingExclusivePublications.erase(registrationId);
+            throw;
         }
-
-        return publication;
     }
 
     /**
@@ -460,16 +501,26 @@ public:
         auto search = m_pendingSubscriptions.find(registrationId);
         if (search == m_pendingSubscriptions.end())
         {
-            throw IllegalArgumentException("Unknown registration id", SOURCEINFO);
+            throw IllegalArgumentException(
+                std::string("Unknown registration id: ").append(std::to_string(registrationId)), SOURCEINFO);
         }
 
-        std::shared_ptr<Subscription> subscription = findSubscription(search->second);
-        if (nullptr != subscription)
+        AsyncAddSubscription* addSubscription = search->second;
+        try
+        {
+            std::shared_ptr<Subscription> subscription = findSubscription(addSubscription);
+            if (nullptr != subscription)
+            {
+                m_pendingSubscriptions.erase(registrationId);
+            }
+            return subscription;
+        }
+        catch (...)
         {
             m_pendingSubscriptions.erase(registrationId);
+            delete addSubscription;
+            throw;
         }
-
-        return subscription;
     }
 
     /**
@@ -490,25 +541,33 @@ public:
         const on_unavailable_image_t &onUnavailableImageHandler)
     {
         auto *addSubscription = new AsyncAddSubscription(onAvailableImageHandler, onUnavailableImageHandler);
-        void *availableClientd =
-            const_cast<void *>(reinterpret_cast<const void *>(&addSubscription->m_onAvailableImage));
-        void *unavailableClientd =
-            const_cast<void *>(reinterpret_cast<const void *>(&addSubscription->m_onUnavailableImage));
-
-        if (aeron_async_add_subscription(
-            &addSubscription->m_async,
-            m_aeron,
-            channel.c_str(),
-            streamId,
-            onAvailableImageCallback,
-            availableClientd,
-            onUnavailableImageCallback,
-            unavailableClientd) < 0)
+        try
         {
-            AERON_MAP_ERRNO_TO_SOURCED_EXCEPTION_AND_THROW;
-        }
+            void *availableClientd =
+                const_cast<void *>(reinterpret_cast<const void *>(&addSubscription->m_onAvailableImage));
+            void *unavailableClientd =
+                const_cast<void *>(reinterpret_cast<const void *>(&addSubscription->m_onUnavailableImage));
 
-        return addSubscription;
+            if (aeron_async_add_subscription(
+                &addSubscription->m_async,
+                m_aeron,
+                channel.c_str(),
+                streamId,
+                onAvailableImageCallback,
+                availableClientd,
+                onUnavailableImageCallback,
+                unavailableClientd) < 0)
+            {
+                AERON_MAP_ERRNO_TO_SOURCED_EXCEPTION_AND_THROW;
+            }
+
+            return addSubscription;
+        }
+        catch (...)
+        {
+            delete addSubscription;
+            throw;
+        }
     }
 
     /**
@@ -549,6 +608,7 @@ public:
         int result = aeron_async_add_subscription_poll(&subscription, addSubscription->m_async);
         if (result < 0)
         {
+            addSubscription->m_async = nullptr;
             AERON_MAP_ERRNO_TO_SOURCED_EXCEPTION_AND_THROW;
         }
         else if (0 == result)
@@ -640,17 +700,24 @@ public:
         auto search = m_pendingCounters.find(registrationId);
         if (search == m_pendingCounters.end())
         {
-            throw IllegalArgumentException("Unknown registration id", SOURCEINFO);
+            throw IllegalArgumentException(
+                std::string("Unknown registration id: ").append(std::to_string(registrationId)), SOURCEINFO);
         }
 
-        std::shared_ptr<Counter> counter = findCounter(search->second);
-
-        if (nullptr != counter)
+        try
+        {
+            std::shared_ptr<Counter> counter = findCounter(search->second);
+            if (nullptr != counter)
+            {
+                m_pendingCounters.erase(registrationId);
+            }
+            return counter;
+        }
+        catch (...)
         {
             m_pendingCounters.erase(registrationId);
+            throw;
         }
-
-        return counter;
     }
 
     /**

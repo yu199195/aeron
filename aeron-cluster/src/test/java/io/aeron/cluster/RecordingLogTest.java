@@ -20,7 +20,6 @@ import io.aeron.archive.client.AeronArchive;
 import io.aeron.archive.client.RecordingDescriptorConsumer;
 import io.aeron.cluster.client.ClusterException;
 import io.aeron.test.Tests;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -484,7 +483,6 @@ class RecordingLogTest
     }
 
     @Test
-    @Disabled("incomplete")
     void shouldFindSnapshotAtOrBeforeOrLowest()
     {
         try (RecordingLog recordingLog = new RecordingLog(tempDir, true))
@@ -493,15 +491,41 @@ class RecordingLogTest
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 777L, 0, 0);
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 777L, 0, 1);
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 777L, 0, SERVICE_ID);
+            recordingLog.appendStandbySnapshot(recordingId++, 1L, 500, 888L, 0, 0, "localhost:8080");
+            recordingLog.appendStandbySnapshot(recordingId++, 1L, 500, 888L, 0, 1, "localhost:8080");
+            recordingLog.appendStandbySnapshot(recordingId++, 1L, 500, 888L, 0, SERVICE_ID, "localhost:8080");
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 888L, 0, 0);
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 888L, 0, 1);
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 888L, 0, SERVICE_ID);
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 890L, 0, 0);
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 890L, 0, SERVICE_ID); // Missing one service snapshot
+            recordingLog.appendStandbySnapshot(recordingId++, 1L, 500, 990L, 0, 0, "localhost:8080");
+            recordingLog.appendStandbySnapshot(recordingId++, 1L, 500, 990L, 0, 1, "localhost:8080");
+            recordingLog.appendStandbySnapshot(recordingId++, 1L, 500, 990L, 0, SERVICE_ID, "localhost:8080");
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 999L, 0, 0);
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 999L, 0, 1);
             recordingLog.appendSnapshot(recordingId++, 1L, 500, 999L, 0, SERVICE_ID);
+
+            final int serviceCount = 2;
+
+            assertSnapshot(recordingLog.findSnapshotAtOrBeforeOrLowest(777L, serviceCount), serviceCount, 777L);
+            assertSnapshot(recordingLog.findSnapshotAtOrBeforeOrLowest(888L, serviceCount), serviceCount, 888L);
+            assertSnapshot(recordingLog.findSnapshotAtOrBeforeOrLowest(999L, serviceCount), serviceCount, 999L);
+            assertSnapshot(recordingLog.findSnapshotAtOrBeforeOrLowest(890L, serviceCount), serviceCount, 888L);
+            assertSnapshot(recordingLog.findSnapshotAtOrBeforeOrLowest(990L, serviceCount), serviceCount, 888L);
+            assertSnapshot(recordingLog.findSnapshotAtOrBeforeOrLowest(750L, serviceCount), serviceCount, 777L);
+            assertSnapshot(recordingLog.findSnapshotAtOrBeforeOrLowest(1000L, serviceCount), serviceCount, 999L);
         }
+    }
+
+    private static void assertSnapshot(
+        final List<Snapshot> snapshot,
+        final int serviceCount,
+        final long logPosition)
+    {
+        assertNotNull(snapshot);
+        assertEquals(serviceCount + 1, snapshot.size());
+        snapshot.forEach((s) -> assertEquals(logPosition, s.logPosition()));
     }
 
     @Test
@@ -1053,6 +1077,7 @@ class RecordingLogTest
         {
             final RecordingLog.RecoveryPlan recoveryPlan = log.createRecoveryPlan(mockArchive, 1, NULL_VALUE);
 
+            assertEquals(2, recoveryPlan.snapshots().size());
             assertEquals(2, recoveryPlan.snapshots().size());
             assertTrue(recoveryPlan.snapshots().stream().anyMatch((s) -> s.recordingId() == 1));
             assertTrue(recoveryPlan.snapshots().stream().anyMatch((s) -> s.recordingId() == 2));
